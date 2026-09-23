@@ -157,6 +157,47 @@ def mark_failed(task, error):
     save_task(task)
 
 
+def mark_publish_state(
+    task,
+    state,
+    git_commit=None,
+    error=None,
+):
+    """
+    记录 Git 发布过程，但不改变 approval_status。
+
+    state 示例：
+    - staging
+    - committed
+    - push_failed
+    - pushed
+    """
+    task["publish_state"] = state
+    task["publish_updated_at"] = now_text()
+
+    if git_commit:
+        task["git_commit"] = git_commit
+
+    if error:
+        task["publish_error"] = str(error)[:1000]
+    else:
+        task["publish_error"] = None
+
+    save_task(task)
+
+
+def clear_publish_state(task):
+    """
+    清理未完成发布状态。
+    approval_status 不受影响。
+    """
+    task["publish_state"] = None
+    task["publish_updated_at"] = now_text()
+    task["publish_error"] = None
+
+    save_task(task)
+
+
 def mark_approved(task, git_commit=None):
     task["approval_status"] = "approved"
     task["approved_at"] = now_text()
@@ -452,6 +493,1247 @@ def build_change_manifest(task_id):
     return changes
 
 
+APPROVAL_PROJECT_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
+
+APPROVAL_PROTECTED_PROJECTS = {
+    "tg-codex-agent",
+}
+
+APPROVAL_BLOCKED_PARTS = {
+    ".git",
+    ".codex",
+    ".env",
+    "data",
+    "logs",
+    "venv",
+    ".venv",
+    "backup",
+    "backups",
+}
+
+APPROVAL_BLOCKED_FILENAMES = {
+    "id_rsa",
+    "id_ed25519",
+    "authorized_keys",
+}
+
+APPROVAL_BLOCKED_SUFFIXES = {
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+}
+
+
+def validate_approval_project(project):
+    if not isinstance(project, str):
+        raise ValueError("Invalid project name")
+
+    if not APPROVAL_PROJECT_PATTERN.fullmatch(project):
+        raise ValueError(
+            f"Invalid project name: {project}"
+        )
+
+    if project in {".", ".."}:
+        raise ValueError(
+            f"Invalid project name: {project}"
+        )
+
+    if project in APPROVAL_PROTECTED_PROJECTS:
+        raise ValueError(
+            f"Protected project cannot be approved: {project}"
+        )
+
+    return project
+
+
+def validate_approval_relative_path(relative):
+    """
+    Approval V1 路径策略。
+
+    只检查 manifest 中的相对路径，不访问 Git 仓库。
+    """
+    if not isinstance(relative, str) or not relative:
+        raise ValueError("Invalid approval path")
+
+    pure = Path(relative)
+
+    if pure.is_absolute():
+        raise ValueError(
+            f"Absolute path is not allowed: {relative}"
+        )
+
+    parts = pure.parts
+
+    if not parts:
+        raise ValueError(
+            f"Invalid approval path: {relative}"
+        )
+
+    for part in parts:
+        if part in {"", ".", ".."}:
+            raise ValueError(
+                f"Unsafe approval path: {relative}"
+            )
+
+        if part.lower() in APPROVAL_BLOCKED_PARTS:
+            raise ValueError(
+                f"Blocked approval path: {relative}"
+            )
+
+    filename = parts[-1]
+    filename_lower = filename.lower()
+
+    if filename_lower in APPROVAL_BLOCKED_FILENAMES:
+        raise ValueError(
+            f"Blocked credential path: {relative}"
+        )
+
+    if filename_lower.startswith(".env"):
+        raise ValueError(
+            f"Blocked environment file: {relative}"
+        )
+
+    if any(
+        filename_lower.endswith(suffix)
+        for suffix in APPROVAL_BLOCKED_SUFFIXES
+    ):
+        raise ValueError(
+            f"Blocked credential file: {relative}"
+        )
+
+    return relative
+
+
+def build_approval_plan(task_id):
+    """
+    构建 Approval 只读计划。
+
+    本函数：
+    - 不修改 Live 项目
+    - 不修改 /root/my-ops
+    - 不执行 git add / commit / push
+    """
+    task_id = validate_task_id(task_id)
+
+    task = load_task(task_id)
+
+    if not task:
+        raise FileNotFoundError(
+            f"Task not found: {task_id}"
+        )
+
+    if task.get("status") != "success":
+        raise ValueError(
+            f"Task is not successful: {task_id}"
+        )
+
+    if task.get("approval_status", "pending") != "pending":
+        raise ValueError(
+            "Task approval status is not pending: "
+            f"{task.get('approval_status')}"
+        )
+
+    project = validate_approval_project(
+        task.get("project")
+    )
+
+    before_root = snapshot_path(
+        task_id,
+        "before",
+    )
+
+    after_root = snapshot_path(
+        task_id,
+        "after",
+    )
+
+    if not before_root.is_dir():
+        raise FileNotFoundError(
+            "Before snapshot does not exist"
+        )
+
+    if not after_root.is_dir():
+        raise FileNotFoundError(
+            "After snapshot does not exist"
+        )
+
+    changes = build_change_manifest(task_id)
+
+    plan = []
+
+    for item in changes:
+        relative = validate_approval_relative_path(
+            item["path"]
+        )
+
+        before_entry = item["before"]
+        after_entry = item["after"]
+
+        # V1 不处理 file <-> directory 类型转换。
+        if (
+            before_entry is not None
+            and after_entry is not None
+            and before_entry.get("type")
+            != after_entry.get("type")
+        ):
+            raise ValueError(
+                "Approval V1 does not allow path type "
+                f"changes: {relative}"
+            )
+
+        if item["change"] == "added":
+            action = "ADD"
+
+        elif item["change"] == "deleted":
+            action = "DELETE"
+
+        elif item["change"] == "modified":
+            action = "MODIFY"
+
+        else:
+            raise ValueError(
+                "Unknown manifest change type: "
+                f"{item['change']}"
+            )
+
+        plan.append(
+            {
+                "action": action,
+                "path": relative,
+                "before": before_entry,
+                "after": after_entry,
+            }
+        )
+
+    return {
+        "task_id": task_id,
+        "project": project,
+        "status": task.get("status"),
+        "approval_status": task.get(
+            "approval_status",
+            "pending",
+        ),
+        "change_count": len(plan),
+        "changes": plan,
+    }
+
+
+SECRET_CONTENT_PATTERNS = [
+    (
+        "private_key",
+        re.compile(
+            rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
+        ),
+    ),
+    (
+        "github_token",
+        re.compile(
+            rb"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"
+        ),
+    ),
+    (
+        "github_fine_grained_token",
+        re.compile(
+            rb"\bgithub_pat_[A-Za-z0-9_]{20,}\b"
+        ),
+    ),
+    (
+        "openai_api_key",
+        re.compile(
+            rb"\bsk-[A-Za-z0-9_-]{20,}\b"
+        ),
+    ),
+    (
+        "slack_token",
+        re.compile(
+            rb"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"
+        ),
+    ),
+    (
+        "aws_access_key",
+        re.compile(
+            rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+        ),
+    ),
+    (
+        "credential_assignment",
+        re.compile(
+            rb"""(?ix)
+            \b
+            (?:api[_-]?key|access[_-]?token|auth[_-]?token|
+               bot[_-]?token|client[_-]?secret|password|
+               passwd|secret)
+            \b
+            \s*
+            [:=]
+            \s*
+            ["']?
+            [^\s"'#]{16,}
+            """
+        ),
+    ),
+]
+
+
+def scan_file_for_secrets(path):
+    """
+    扫描单个普通文件。
+    返回规则名称，不返回命中的 secret 内容。
+    """
+    path = Path(path)
+
+    info = path.lstat()
+
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(
+            f"Secret scan requires regular file: {path}"
+        )
+
+    data = path.read_bytes()
+
+    matches = []
+
+    for rule_name, pattern in SECRET_CONTENT_PATTERNS:
+        if pattern.search(data):
+            matches.append(rule_name)
+
+    return sorted(set(matches))
+
+
+def scan_approval_snapshot_for_secrets(task_id):
+    """
+    只扫描 Task manifest 中 After Snapshot 的新增/修改文件。
+    删除文件无需扫描。
+
+    返回：
+    {
+        "safe": bool,
+        "findings": [
+            {"path": "...", "rules": [...]}
+        ]
+    }
+
+    不返回任何 secret 原文。
+    """
+    task_id = validate_task_id(task_id)
+
+    plan = build_approval_plan(task_id)
+    after_root = snapshot_path(task_id, "after")
+
+    findings = []
+
+    for item in plan["changes"]:
+        after_entry = item["after"]
+
+        if (
+            after_entry is None
+            or after_entry.get("type") != "file"
+        ):
+            continue
+
+        relative = item["path"]
+        validate_approval_relative_path(relative)
+
+        source = after_root / relative
+
+        rules = scan_file_for_secrets(source)
+
+        if rules:
+            findings.append(
+                {
+                    "path": relative,
+                    "rules": rules,
+                }
+            )
+
+    return {
+        "safe": not findings,
+        "findings": findings,
+    }
+
+
+def validate_git_publish_state(
+    repo_root="/root/my-ops",
+    fetch=False,
+):
+    """
+    Git 发布前状态检查。
+
+    要求：
+    - 必须是有效 Git 仓库
+    - 当前分支必须是 main
+    - origin/main 必须存在
+    - 本地 HEAD 必须与 origin/main 完全一致
+
+    fetch=True 时先执行 git fetch origin main。
+    本函数不 commit、不 push。
+    """
+    repo_root = Path(repo_root).resolve()
+
+    if not (repo_root / ".git").exists():
+        raise ValueError(
+            f"Not a Git repository: {repo_root}"
+        )
+
+    if fetch:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "fetch",
+                "origin",
+                "main",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    branch = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "branch",
+            "--show-current",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    if branch != "main":
+        raise RuntimeError(
+            f"Git branch must be main, current: {branch}"
+        )
+
+    local_head = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "rev-parse",
+            "HEAD",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    remote = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "rev-parse",
+            "--verify",
+            "origin/main",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if remote.returncode != 0:
+        raise RuntimeError(
+            "origin/main does not exist"
+        )
+
+    origin_head = remote.stdout.strip()
+
+    if local_head != origin_head:
+        raise RuntimeError(
+            "Local HEAD does not match origin/main"
+        )
+
+    return {
+        "safe": True,
+        "branch": branch,
+        "local_head": local_head,
+        "origin_head": origin_head,
+    }
+
+
+def validate_staged_scope(
+    task_id,
+    repo_root="/root/my-ops",
+):
+    """
+    二次验证 Git staging area。
+
+    staging 中出现的每一个路径都必须属于当前 Task manifest。
+    不允许夹带任何其它文件。
+
+    注意：
+    Task manifest 中的目录不会作为 Git entry 出现，
+    因此 expected 只统计 file 类型的 before/after entry。
+    """
+    task_id = validate_task_id(task_id)
+
+    plan = build_approval_plan(task_id)
+    project = plan["project"]
+
+    repo_root = Path(repo_root).resolve()
+
+    expected = set()
+
+    for item in plan["changes"]:
+        before_entry = item["before"]
+        after_entry = item["after"]
+
+        before_is_file = (
+            before_entry is not None
+            and before_entry.get("type") == "file"
+        )
+
+        after_is_file = (
+            after_entry is not None
+            and after_entry.get("type") == "file"
+        )
+
+        if not (before_is_file or after_is_file):
+            continue
+
+        relative = validate_approval_relative_path(
+            item["path"]
+        )
+
+        expected.add(
+            (
+                Path("apps")
+                / project
+                / relative
+            ).as_posix()
+        )
+
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--cached",
+            "--name-only",
+            "--no-renames",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    staged = {
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip()
+    }
+
+    unexpected = sorted(
+        staged - expected
+    )
+
+    if unexpected:
+        raise RuntimeError(
+            "Staged scope violation: unexpected paths: "
+            + json.dumps(
+                unexpected,
+                ensure_ascii=False,
+            )
+        )
+
+    if not staged:
+        raise RuntimeError(
+            "Approval produced no staged Git changes"
+        )
+
+    return {
+        "safe": True,
+        "expected": sorted(expected),
+        "staged": sorted(staged),
+    }
+
+
+def stage_task_for_approval(
+    task_id,
+    repo_root="/root/my-ops",
+):
+    """
+    将单个 Task 的变更精确应用到 Git staging area。
+
+    本函数：
+    - 要求 Task success + pending
+    - 要求 Live 仍等于 Task After Snapshot
+    - 要求 Git working tree / index 开始时完全干净
+    - 只处理 Task manifest 中的路径
+    - 执行 git add --all -- 指定路径
+    - 执行 git diff --cached --check
+    - 不 commit
+    - 不 push
+    - 不 mark approved
+    """
+    task_id = validate_task_id(task_id)
+
+    plan = build_approval_plan(task_id)
+    project = plan["project"]
+
+    # --------------------------------------------------------
+    # Secret Scan 必须发生在任何 Git 工作区修改之前。
+    # 只扫描 immutable After Snapshot 中属于本 Task 的文件。
+    # 错误信息只包含路径和规则名称，不包含 secret 原文。
+    # --------------------------------------------------------
+    secret_scan = scan_approval_snapshot_for_secrets(task_id)
+
+    if not secret_scan["safe"]:
+        safe_findings = [
+            {
+                "path": item["path"],
+                "rules": item["rules"],
+            }
+            for item in secret_scan["findings"]
+        ]
+
+        raise RuntimeError(
+            "Secret scan blocked approval: "
+            + json.dumps(
+                safe_findings,
+                ensure_ascii=False,
+            )
+        )
+
+    live_root = Path("/ops/apps") / project
+
+    live_check = check_live_matches_after(
+        task_id,
+        live_root,
+    )
+
+    if not live_check["safe"]:
+        raise RuntimeError(
+            "Live project no longer matches Task After: "
+            + json.dumps(
+                live_check["conflicts"],
+                ensure_ascii=False,
+            )
+        )
+
+    repo_root = Path(repo_root).resolve()
+
+    if not repo_root.is_dir():
+        raise FileNotFoundError(
+            f"Git repository does not exist: {repo_root}"
+        )
+
+    git_dir = repo_root / ".git"
+
+    if not git_dir.exists():
+        raise ValueError(
+            f"Not a Git repository: {repo_root}"
+        )
+
+    status = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "status",
+            "--porcelain",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    if status.stdout.strip():
+        raise RuntimeError(
+            "Git repository is not clean before approval"
+        )
+
+    after_root = snapshot_path(
+        task_id,
+        "after",
+    )
+
+    repo_project = (
+        repo_root
+        / "apps"
+        / project
+    )
+
+    repo_apps = (
+        repo_root
+        / "apps"
+    ).resolve()
+
+    repo_project_resolved = repo_project.resolve(
+        strict=False
+    )
+
+    if (
+        repo_project_resolved.parent
+        != repo_apps
+    ):
+        raise ValueError(
+            "Unsafe repository project path"
+        )
+
+    changed_git_paths = []
+
+    # --------------------------------------------------------
+    # 先创建 / 恢复目录。
+    # --------------------------------------------------------
+    directories_to_create = []
+
+    for item in plan["changes"]:
+        after_entry = item["after"]
+
+        if (
+            after_entry is not None
+            and after_entry.get("type")
+            == "directory"
+        ):
+            directories_to_create.append(item)
+
+    for item in sorted(
+        directories_to_create,
+        key=lambda x: x["path"].count("/"),
+    ):
+        relative = item["path"]
+        destination = repo_project / relative
+
+        destination.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        os.chmod(
+            destination,
+            item["after"]["mode"],
+        )
+
+    # --------------------------------------------------------
+    # ADD / MODIFY 文件：
+    # 只从 root-owned After Snapshot 复制。
+    # --------------------------------------------------------
+    for item in plan["changes"]:
+        relative = item["path"]
+        after_entry = item["after"]
+
+        git_relative = (
+            Path("apps")
+            / project
+            / relative
+        ).as_posix()
+
+        changed_git_paths.append(
+            git_relative
+        )
+
+        if after_entry is None:
+            continue
+
+        if after_entry.get("type") != "file":
+            continue
+
+        source = after_root / relative
+        destination = repo_project / relative
+
+        source_info = source.lstat()
+
+        if not stat.S_ISREG(source_info.st_mode):
+            raise ValueError(
+                "Approval source is not a regular file: "
+                f"{relative}"
+            )
+
+        destination.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        shutil.copy2(
+            source,
+            destination,
+            follow_symlinks=False,
+        )
+
+        os.chmod(
+            destination,
+            after_entry["mode"],
+        )
+
+    # --------------------------------------------------------
+    # DELETE：
+    # 文件先删，目录最后按深度倒序删除。
+    # --------------------------------------------------------
+    deleted_files = []
+    deleted_directories = []
+
+    for item in plan["changes"]:
+        if item["after"] is not None:
+            continue
+
+        before_entry = item["before"]
+
+        if before_entry.get("type") == "file":
+            deleted_files.append(item)
+        elif before_entry.get("type") == "directory":
+            deleted_directories.append(item)
+
+    for item in deleted_files:
+        destination = (
+            repo_project / item["path"]
+        )
+
+        try:
+            info = destination.lstat()
+        except FileNotFoundError:
+            continue
+
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(
+                "Refusing to delete non-regular Git path: "
+                f"{item['path']}"
+            )
+
+        destination.unlink()
+
+    for item in sorted(
+        deleted_directories,
+        key=lambda x: x["path"].count("/"),
+        reverse=True,
+    ):
+        destination = (
+            repo_project / item["path"]
+        )
+
+        try:
+            info = destination.lstat()
+        except FileNotFoundError:
+            continue
+
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(
+                "Refusing to delete non-directory Git path: "
+                f"{item['path']}"
+            )
+
+        try:
+            destination.rmdir()
+        except OSError:
+            raise RuntimeError(
+                "Refusing to delete non-empty Git directory: "
+                f"{item['path']}"
+            )
+
+    if changed_git_paths:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "add",
+                "--all",
+                "--",
+                *changed_git_paths,
+            ],
+            check=True,
+        )
+
+    diff_check = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--cached",
+            "--check",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if diff_check.returncode != 0:
+        raise RuntimeError(
+            "git diff --cached --check failed: "
+            + diff_check.stdout
+            + diff_check.stderr
+        )
+
+    # --------------------------------------------------------
+    # 二次验证 staging 范围。
+    # 即使前面的 apply/stage 逻辑未来出现 bug，
+    # 也不允许夹带当前 Task manifest 之外的任何文件。
+    # --------------------------------------------------------
+    scope_check = validate_staged_scope(
+        task_id,
+        repo_root,
+    )
+
+    staged = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--cached",
+            "--name-status",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    return {
+        "task_id": task_id,
+        "project": project,
+        "change_count": plan["change_count"],
+        "git_paths": changed_git_paths,
+        "staged": staged.stdout.strip(),
+        "scope_check": scope_check,
+    }
+
+
+def publish_task_to_git(
+    task_id,
+    repo_root="/root/my-ops",
+):
+    """
+    正式发布单个 Task 到 GitHub。
+
+    安全顺序：
+    1. Task 必须 success + pending
+    2. 如果之前 commit 成功但 push 失败，只允许安全重试 push
+    3. 新发布必须先 fetch，并确认 HEAD == origin/main
+    4. stage_task_for_approval 执行全部 staging 安全检查
+    5. commit
+    6. push
+    7. fetch + 验证 origin/main == commit SHA
+    8. 最后才 mark_approved
+
+    push 失败时：
+    - approval_status 保持 pending
+    - publish_state = push_failed
+    - 保存已经生成的 commit SHA
+    """
+    task_id = validate_task_id(task_id)
+    repo_root = Path(repo_root).resolve()
+
+    task = load_task(task_id)
+
+    if task.get("status") != "success":
+        raise RuntimeError(
+            "Task status must be success"
+        )
+
+    if task.get("approval_status") != "pending":
+        raise RuntimeError(
+            "Task approval status must be pending"
+        )
+
+    # --------------------------------------------------------
+    # Retry 模式：
+    # 上一次已经 commit，但 push 失败。
+    # 不允许重新 stage / commit，只重试这个已记录 commit。
+    # --------------------------------------------------------
+    if task.get("publish_state") == "push_failed":
+        commit_sha = task.get("git_commit")
+
+        if not commit_sha:
+            raise RuntimeError(
+                "push_failed task has no git_commit"
+            )
+
+        current_head = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "rev-parse",
+                "HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        if current_head != commit_sha:
+            raise RuntimeError(
+                "Cannot retry push: HEAD does not match "
+                "recorded Task commit"
+            )
+
+        commit_message = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "show",
+                "-s",
+                "--format=%s",
+                commit_sha,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        if task_id not in commit_message:
+            raise RuntimeError(
+                "Cannot retry push: commit does not belong "
+                "to this Task"
+            )
+
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "push",
+                    "origin",
+                    "main",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            mark_publish_state(
+                task,
+                "push_failed",
+                git_commit=commit_sha,
+                error="git push failed",
+            )
+            raise RuntimeError(
+                "Git push failed; Task remains pending"
+            ) from exc
+
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "fetch",
+                "origin",
+                "main",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        origin_head = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "rev-parse",
+                "origin/main",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        if origin_head != commit_sha:
+            raise RuntimeError(
+                "Push completed but origin/main verification failed"
+            )
+
+        task = load_task(task_id)
+        mark_publish_state(
+            task,
+            "pushed",
+            git_commit=commit_sha,
+        )
+
+        task = load_task(task_id)
+        mark_approved(
+            task,
+            git_commit=commit_sha,
+        )
+
+        return {
+            "task_id": task_id,
+            "project": task["project"],
+            "commit": commit_sha,
+            "retry": True,
+            "approved": True,
+        }
+
+    # --------------------------------------------------------
+    # 新发布。
+    # Git 仓库必须从与 origin/main 完全一致的状态开始。
+    # --------------------------------------------------------
+    validate_git_publish_state(
+        repo_root,
+        fetch=True,
+    )
+
+    mark_publish_state(
+        task,
+        "staging",
+    )
+
+    try:
+        stage_result = stage_task_for_approval(
+            task_id,
+            repo_root,
+        )
+    except Exception:
+        task = load_task(task_id)
+        clear_publish_state(task)
+        raise
+
+    # staging 完成后再次执行范围校验。
+    validate_staged_scope(
+        task_id,
+        repo_root,
+    )
+
+    commit_message = (
+        f"task: approve {task['project']} {task_id}"
+    )
+
+    try:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "commit",
+                "-m",
+                commit_message,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        task = load_task(task_id)
+        clear_publish_state(task)
+
+        raise RuntimeError(
+            "Git commit failed; Task remains pending"
+        ) from exc
+
+    commit_sha = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "rev-parse",
+            "HEAD",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    task = load_task(task_id)
+    mark_publish_state(
+        task,
+        "committed",
+        git_commit=commit_sha,
+    )
+
+    try:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "push",
+                "origin",
+                "main",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        task = load_task(task_id)
+
+        mark_publish_state(
+            task,
+            "push_failed",
+            git_commit=commit_sha,
+            error="git push failed",
+        )
+
+        raise RuntimeError(
+            "Git commit succeeded but push failed; "
+            "Task remains pending and can retry push"
+        ) from exc
+
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "fetch",
+            "origin",
+            "main",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    origin_head = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "rev-parse",
+            "origin/main",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    if origin_head != commit_sha:
+        task = load_task(task_id)
+
+        mark_publish_state(
+            task,
+            "push_failed",
+            git_commit=commit_sha,
+            error="origin/main verification failed",
+        )
+
+        raise RuntimeError(
+            "Push verification failed; Task remains pending"
+        )
+
+    task = load_task(task_id)
+
+    mark_publish_state(
+        task,
+        "pushed",
+        git_commit=commit_sha,
+    )
+
+    task = load_task(task_id)
+
+    mark_approved(
+        task,
+        git_commit=commit_sha,
+    )
+
+    return {
+        "task_id": task_id,
+        "project": task["project"],
+        "commit": commit_sha,
+        "retry": False,
+        "approved": True,
+        "staged": stage_result["staged"],
+    }
+
+
 def inspect_live_path(path):
     """
     返回 Live 路径当前状态。
@@ -612,6 +1894,21 @@ def check_reject_conflicts(task_id, project_path):
         "change_count": len(changes),
         "conflicts": conflicts,
     }
+
+
+def check_live_matches_after(task_id, project_path):
+    """
+    通用安全检查：
+
+    验证当前 Live 项目中属于该 Task 的变更路径，
+    是否仍然与 Task After Snapshot 一致。
+
+    Approve / Reject 都必须通过此检查。
+    """
+    return check_reject_conflicts(
+        task_id,
+        project_path,
+    )
 
 
 def reject_task_changes(task_id, project_path):

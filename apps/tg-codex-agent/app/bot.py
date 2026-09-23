@@ -1,3 +1,5 @@
+import re
+import shutil
 import asyncio
 import json
 import logging
@@ -32,6 +34,7 @@ from task_manager import (
     mark_running,
     mark_success,
     reject_task_changes,
+    publish_task_to_git,
 )
 
 
@@ -467,6 +470,34 @@ async def execute_codex_task(
                 project,
             )
 
+            # 新项目允许直接通过 Telegram 创建。
+            # 创建动作必须位于 TASK_LOCK 内，避免并发 Task
+            # 同时初始化同一个项目。
+            if not workdir.exists():
+                workdir.mkdir(
+                    mode=0o755,
+                    parents=False,
+                    exist_ok=False,
+                )
+
+                shutil.chown(
+                    workdir,
+                    user="codex-runner",
+                    group="codex-runner",
+                )
+
+                logger.info(
+                    "已创建新项目目录 task_id=%s project=%s path=%s",
+                    task_id,
+                    project,
+                    workdir,
+                )
+
+            # 无论新项目还是已有项目，都重新走正式路径校验。
+            workdir = validate_workdir(
+                workdir
+            )
+
             # Codex 执行前保存项目完整基线。
             # 后续 /diff、/reject、/approve 都以该快照为准。
             create_snapshot(
@@ -603,8 +634,14 @@ async def start_command(
         "可用命令：\n"
         "/status - 查看系统状态\n"
         "/usage - 查看 Codex 额度\n"
-        "/task <项目> <需求> - 创建 Codex 开发任务\n"
-        "/whoami - 查看当前 Telegram User ID"
+        "/task 项目名 开发需求 - 创建/继续 Codex 开发任务\n"
+        "/task_status Task_ID - 查看任务状态\n"
+        "/diff Task_ID - 查看任务变更\n"
+        "/approve Task_ID - 审批并发布到 GitHub\n"
+        "/reject Task_ID - 拒绝并安全回滚\n"
+        "/whoami - 查看当前 Telegram User ID\n\n"
+        "项目名示例：public-vpn-node\n"
+        "不要输入 < > 尖括号。"
     )
 
 
@@ -713,34 +750,24 @@ async def task_command(
         )
         return
 
-    # 项目参数只能是 /ops/apps 下的一级目录名。
-    # 禁止通过 ../ 或 / 等方式改变目标路径。
-    if (
-        project in {
-            ".",
-            "..",
-        }
-        or "/" in project
-        or "\\" in project
+    # 项目名只允许安全的一级目录名称。
+    # 新项目可以不存在，真正创建动作在 TASK_LOCK 内执行。
+    if not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]*",
+        project,
     ):
         await update.message.reply_text(
-            "❌ 项目名无效。"
+            "❌ 项目名无效。\n\n"
+            "只允许英文、数字、点、下划线、短横线，"
+            "并且必须以英文或数字开头。\n"
+            "例如：public-vpn-node"
         )
         return
 
-    workdir = (
-        WORK_ROOT / project
-    )
-
-    try:
-        validate_workdir(
-            workdir
-        )
-
-    except Exception as exc:
+    if project == "tg-codex-agent":
         await update.message.reply_text(
-            "❌ 项目不可执行\n\n"
-            f"{exc}"
+            "❌ 该项目属于 TG-Codex Agent 自身，"
+            "禁止通过 Codex Task 修改。"
         )
         return
 
@@ -929,6 +956,125 @@ async def diff_command(
         f"Task：{task_id}\n"
         f"项目：{task.get('project', '-')}\n\n"
         f"{display_diff}"
+    )
+
+
+async def approve_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_allowed(update):
+        await deny(update)
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "用法：/approve <task_id>"
+        )
+        return
+
+    task_id = context.args[0].strip()
+
+    try:
+        task = load_task(task_id)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Task ID 格式无效。"
+        )
+        return
+
+    if not task:
+        await update.message.reply_text(
+            f"❌ Task 不存在：{task_id}"
+        )
+        return
+
+    if task.get("status") != "success":
+        await update.message.reply_text(
+            "❌ 只有执行成功的 Task 才能 Approve。\n\n"
+            f"Task：{task_id}\n"
+            f"当前状态：{task.get('status', 'unknown')}"
+        )
+        return
+
+    if task.get("approval_status", "pending") != "pending":
+        await update.message.reply_text(
+            "❌ 该 Task 已经处理过。\n\n"
+            f"Task：{task_id}\n"
+            "审批状态："
+            f"{task.get('approval_status', 'unknown')}"
+        )
+        return
+
+    project = task.get("project")
+
+    if not project:
+        await update.message.reply_text(
+            "❌ Task 缺少项目名称，无法 Approve。"
+        )
+        return
+
+    # 与 /task 和 /reject 共用全局锁。
+    # 发布期间禁止其它 Task 同时改变 Live 项目或 Git 发布状态。
+    await update.message.reply_text(
+        "⏳ 正在执行安全审批并发布到 GitHub...\n\n"
+        f"Task：{task_id}\n"
+        f"项目：{project}\n\n"
+        "发布完成前请勿重复提交 Approve。"
+    )
+
+    try:
+        async with TASK_LOCK:
+            result = await asyncio.to_thread(
+                publish_task_to_git,
+                task_id,
+            )
+
+    except RuntimeError as exc:
+        logger.warning(
+            "Approve 被拒绝或发布失败 task_id=%s error=%s",
+            task_id,
+            exc,
+        )
+
+        # 不把内部 Git stderr / secret 等详细内容直接发到 TG。
+        # publish_task_to_git 会确保失败时不会错误标记 approved。
+        await update.message.reply_text(
+            "⚠️ Approve 未完成。\n\n"
+            f"Task：{task_id}\n"
+            f"项目：{project}\n"
+            f"原因：{str(exc)[:1000]}\n\n"
+            "Task 不会因为本次失败被错误标记为 approved。"
+        )
+        return
+
+    except Exception:
+        logger.exception(
+            "Approve 失败 task_id=%s",
+            task_id,
+        )
+
+        await update.message.reply_text(
+            "❌ Approve 发生异常。\n\n"
+            f"Task：{task_id}\n"
+            f"项目：{project}\n\n"
+            "请检查服务器日志。Task 不会被自动标记为 approved。"
+        )
+        return
+
+    retry_text = (
+        "是（恢复之前失败的 Push）"
+        if result.get("retry")
+        else "否"
+    )
+
+    await update.message.reply_text(
+        "✅ Task 已 Approve 并发布到 GitHub\n\n"
+        f"Task：{task_id}\n"
+        f"项目：{project}\n"
+        f"Commit：{result['commit']}\n"
+        "审批状态：approved\n"
+        f"Push 重试：{retry_text}"
     )
 
 
@@ -1160,6 +1306,13 @@ def main():
         CommandHandler(
             "diff",
             diff_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "approve",
+            approve_command,
         )
     )
 
