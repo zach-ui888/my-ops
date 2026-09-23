@@ -36,7 +36,7 @@ CODEX_BIN = Path(
 CODEX_TIMEOUT = int(
     os.getenv(
         "CODEX_EXEC_TIMEOUT",
-        "600",
+        "3600",
     )
 )
 
