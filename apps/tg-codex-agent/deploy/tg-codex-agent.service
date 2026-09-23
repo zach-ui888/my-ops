@@ -1,0 +1,22 @@
+[Unit]
+Description=TG Codex Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/ops/apps/tg-codex-agent
+
+ExecStart=/ops/apps/tg-codex-agent/venv/bin/python /ops/apps/tg-codex-agent/app/bot.py
+
+Restart=always
+RestartSec=5
+
+Environment=PYTHONUNBUFFERED=1
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
