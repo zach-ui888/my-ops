@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import subprocess
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -634,6 +635,7 @@ async def start_command(
         "可用命令：\n"
         "/status - 查看系统状态\n"
         "/usage - 查看 Codex 额度\n"
+        "/disk - 查看服务器磁盘存储\n"
         "/task 项目名 开发需求 - 创建/继续 Codex 开发任务\n"
         "/task_status Task_ID - 查看任务状态\n"
         "/diff Task_ID - 查看任务变更\n"
@@ -677,6 +679,119 @@ async def status_command(
         f"告警阈值：{QUOTA_ALERT_THRESHOLD}%\n"
         "GitHub：待接入"
     )
+
+
+# ============================================================
+# /disk
+# ============================================================
+
+def format_bytes(size: int) -> str:
+    value = float(size)
+
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if value < 1024 or unit == "PB":
+            if unit in ("B", "KB"):
+                return f"{value:.0f} {unit}"
+
+            return f"{value:.2f} {unit}"
+
+        value /= 1024
+
+    return f"{value:.2f} PB"
+
+
+def directory_size(path: str) -> str:
+    try:
+        result = subprocess.run(
+            [
+                "du",
+                "-sb",
+                "--",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+
+        size = int(
+            result.stdout.split()[0]
+        )
+
+        return format_bytes(size)
+
+    except Exception:
+        logger.exception(
+            "读取目录大小失败: %s",
+            path,
+        )
+
+        return "读取失败"
+
+
+async def disk_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_allowed(update):
+        await deny(update)
+        return
+
+    try:
+        usage = shutil.disk_usage("/")
+
+        total = usage.total
+        used = usage.used
+        free = usage.free
+
+        percent = (
+            used / total * 100
+            if total
+            else 0
+        )
+
+        if percent >= 95:
+            state = "🔴 严重"
+        elif percent >= 85:
+            state = "🟠 警告"
+        elif percent >= 70:
+            state = "🟡 注意"
+        else:
+            state = "🟢 正常"
+
+        ops_size, repo_size = await asyncio.gather(
+            asyncio.to_thread(
+                directory_size,
+                "/ops",
+            ),
+            asyncio.to_thread(
+                directory_size,
+                "/root/my-ops",
+            ),
+        )
+
+        await update.message.reply_text(
+            "💾 服务器存储状态\n\n"
+            "根分区 /\n"
+            f"总容量：{format_bytes(total)}\n"
+            f"已使用：{format_bytes(used)}\n"
+            f"剩余：{format_bytes(free)}\n"
+            f"使用率：{percent:.1f}%\n\n"
+            "目录占用\n"
+            f"/ops：{ops_size}\n"
+            f"/root/my-ops：{repo_size}\n\n"
+            f"状态：{state}"
+        )
+
+    except Exception:
+        logger.exception(
+            "读取服务器磁盘状态失败"
+        )
+
+        await update.message.reply_text(
+            "❌ 服务器磁盘状态读取失败，请检查服务日志。"
+        )
 
 
 # ============================================================
@@ -1285,6 +1400,13 @@ def main():
         CommandHandler(
             "usage",
             usage_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "disk",
+            disk_command,
         )
     )
 
