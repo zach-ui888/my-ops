@@ -24,10 +24,14 @@ from quota import (
 
 from task_manager import (
     TASK_LOCK,
+    build_task_diff,
+    create_snapshot,
     create_task,
+    load_task,
     mark_failed,
     mark_running,
     mark_success,
+    reject_task_changes,
 )
 
 
@@ -463,6 +467,15 @@ async def execute_codex_task(
                 project,
             )
 
+            # Codex 执行前保存项目完整基线。
+            # 后续 /diff、/reject、/approve 都以该快照为准。
+            create_snapshot(
+                task_id,
+                workdir,
+                "before",
+            )
+            task["snapshot_before"] = True
+
             mark_running(
                 task
             )
@@ -483,6 +496,14 @@ async def execute_codex_task(
                 workdir,
                 task["prompt"],
             )
+
+            # Codex 成功返回后保存修改后的项目状态。
+            create_snapshot(
+                task_id,
+                workdir,
+                "after",
+            )
+            task["snapshot_after"] = True
 
             mark_success(
                 task,
@@ -773,6 +794,272 @@ async def task_command(
 # /whoami
 # ============================================================
 
+async def task_status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_allowed(update):
+        await deny(update)
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "用法：/task_status <task_id>"
+        )
+        return
+
+    task_id = context.args[0].strip()
+    task = load_task(task_id)
+
+    if not task:
+        await update.message.reply_text(
+            f"❌ Task 不存在：{task_id}"
+        )
+        return
+
+    status = task.get("status", "unknown")
+    approval_status = task.get(
+        "approval_status",
+        "pending",
+    )
+
+    snapshot_before = (
+        "✅"
+        if task.get("snapshot_before")
+        else "❌"
+    )
+
+    snapshot_after = (
+        "✅"
+        if task.get("snapshot_after")
+        else "❌"
+    )
+
+    git_commit = task.get("git_commit") or "-"
+
+    await update.message.reply_text(
+        "📋 Task 状态\n\n"
+        f"Task：{task_id}\n"
+        f"项目：{task.get('project', '-')}\n"
+        f"执行状态：{status}\n"
+        f"审批状态：{approval_status}\n\n"
+        f"创建时间：{task.get('created_at') or '-'}\n"
+        f"开始时间：{task.get('started_at') or '-'}\n"
+        f"完成时间：{task.get('finished_at') or '-'}\n\n"
+        f"Before Snapshot：{snapshot_before}\n"
+        f"After Snapshot：{snapshot_after}\n"
+        f"Git Commit：{git_commit}"
+    )
+
+
+async def diff_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_allowed(update):
+        await deny(update)
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "用法：/diff <task_id>"
+        )
+        return
+
+    task_id = context.args[0].strip()
+    task = load_task(task_id)
+
+    if not task:
+        await update.message.reply_text(
+            f"❌ Task 不存在：{task_id}"
+        )
+        return
+
+    if not task.get("snapshot_before"):
+        await update.message.reply_text(
+            "❌ 该 Task 没有 Before Snapshot，"
+            "无法生成 Diff。"
+        )
+        return
+
+    if not task.get("snapshot_after"):
+        await update.message.reply_text(
+            "❌ 该 Task 没有 After Snapshot，"
+            "无法生成 Diff。"
+        )
+        return
+
+    try:
+        diff_text = await asyncio.to_thread(
+            build_task_diff,
+            task_id,
+        )
+    except Exception as exc:
+        logger.exception(
+            "生成 Task Diff 失败 task_id=%s",
+            task_id,
+        )
+
+        await update.message.reply_text(
+            "❌ 生成 Diff 失败\n\n"
+            f"Task：{task_id}\n"
+            f"错误：{str(exc)[:2000]}"
+        )
+        return
+
+    if not diff_text.strip():
+        await update.message.reply_text(
+            "ℹ️ 该 Task 没有文件差异。\n\n"
+            f"Task：{task_id}"
+        )
+        return
+
+    max_diff_length = 3400
+
+    display_diff = diff_text
+
+    if len(display_diff) > max_diff_length:
+        display_diff = (
+            display_diff[:max_diff_length]
+            + "\n\n……Diff 过长，已截断。"
+        )
+
+    await update.message.reply_text(
+        "🧾 Task Diff\n\n"
+        f"Task：{task_id}\n"
+        f"项目：{task.get('project', '-')}\n\n"
+        f"{display_diff}"
+    )
+
+
+async def reject_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_allowed(update):
+        await deny(update)
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "用法：/reject <task_id>"
+        )
+        return
+
+    task_id = context.args[0].strip()
+
+    try:
+        task = load_task(task_id)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Task ID 格式无效。"
+        )
+        return
+
+    if not task:
+        await update.message.reply_text(
+            f"❌ Task 不存在：{task_id}"
+        )
+        return
+
+    if task.get("status") != "success":
+        await update.message.reply_text(
+            "❌ 只有执行成功的 Task 才能 Reject。\n\n"
+            f"Task：{task_id}\n"
+            f"当前状态：{task.get('status', 'unknown')}"
+        )
+        return
+
+    if task.get("approval_status", "pending") != "pending":
+        await update.message.reply_text(
+            "❌ 该 Task 已经处理过。\n\n"
+            f"Task：{task_id}\n"
+            "审批状态："
+            f"{task.get('approval_status', 'unknown')}"
+        )
+        return
+
+    project = task.get("project")
+
+    if not project:
+        await update.message.reply_text(
+            "❌ Task 缺少项目名称，无法 Reject。"
+        )
+        return
+
+    workdir = WORK_ROOT / project
+
+    try:
+        workdir = validate_workdir(workdir)
+    except Exception as exc:
+        logger.warning(
+            "Reject 项目路径验证失败 task_id=%s project=%s error=%s",
+            task_id,
+            project,
+            exc,
+        )
+
+        await update.message.reply_text(
+            "❌ 项目路径验证失败，拒绝执行 Reject。\n\n"
+            f"Task：{task_id}\n"
+            f"项目：{project}"
+        )
+        return
+
+    await update.message.reply_text(
+        "⏳ 正在检查并回滚 Task...\n\n"
+        f"Task：{task_id}\n"
+        f"项目：{project}"
+    )
+
+    try:
+        # 与 Codex Task 共用全局锁。
+        # Reject 期间不允许新的 Codex Task 同时修改项目。
+        async with TASK_LOCK:
+            result = await asyncio.to_thread(
+                reject_task_changes,
+                task_id,
+                workdir,
+            )
+
+    except RuntimeError as exc:
+        logger.warning(
+            "Reject 冲突 task_id=%s error=%s",
+            task_id,
+            exc,
+        )
+
+        await update.message.reply_text(
+            "⚠️ Reject 已拒绝执行。\n\n"
+            f"Task：{task_id}\n"
+            "检测到 Task 完成后相关文件又发生变化。\n"
+            "为避免覆盖后续修改，没有改动任何文件。"
+        )
+        return
+
+    except Exception as exc:
+        logger.exception(
+            "Reject 失败 task_id=%s",
+            task_id,
+        )
+
+        await update.message.reply_text(
+            "❌ Reject 失败。\n\n"
+            f"Task：{task_id}\n"
+            f"错误：{str(exc)[:1500]}"
+        )
+        return
+
+    await update.message.reply_text(
+        "↩️ Task 已 Reject 并完成安全回滚\n\n"
+        f"Task：{task_id}\n"
+        f"项目：{project}\n"
+        f"回滚变更：{result['change_count']} 项\n"
+        "审批状态：rejected\n\n"
+        "未执行 Git commit / push。"
+    )
+
+
 async def whoami_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -859,6 +1146,27 @@ def main():
         CommandHandler(
             "task",
             task_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "task_status",
+            task_status_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "diff",
+            diff_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "reject",
+            reject_command,
         )
     )
 
