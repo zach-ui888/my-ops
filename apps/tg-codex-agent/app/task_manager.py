@@ -1544,6 +1544,7 @@ def stage_task_for_approval(
         "git_paths": changed_git_paths,
         "staged": staged.stdout.strip(),
         "scope_check": scope_check,
+        "plan": plan,
     }
 
 
@@ -1740,9 +1741,14 @@ def publish_task_to_git(
         raise
 
     # staging 完成后再次执行范围校验。
+    # 必须复用本次 staging 开始前生成的 Approval plan。
+    # 首次发布过程中 apps/<project> 已经被创建，如果这里重新
+    # build_approval_plan()，会错误地从 initial publish
+    # 切换为普通增量模式。
     validate_staged_scope(
         task_id,
         repo_root,
+        plan=stage_result["plan"],
     )
 
     commit_message = (
