@@ -1,0 +1,34 @@
+{
+  "name": "public-vpn-node",
+  "services": {
+    "vpn": {
+      "build": {"context": ".", "dockerfile": "Dockerfile"},
+      "image": "public-vpn-node:14b8036-safe1",
+      "restart": "unless-stopped",
+      "init": true,
+      "stop_grace_period": "30s",
+      "cap_drop": ["ALL"],
+      "cap_add": ["NET_ADMIN", "NET_RAW"],
+      "devices": ["/dev/net/tun:/dev/net/tun:rw"],
+      "security_opt": ["no-new-privileges:true"],
+      "read_only": true,
+      "tmpfs": ["/tmp:rw,noexec,nosuid,size=16m,mode=1777"],
+      "sysctls": {"net.ipv4.conf.all.rp_filter": "2", "net.ipv4.conf.default.rp_filter": "2"},
+      "ports": ["127.0.0.1:8787:8787", "127.0.0.1:7928:7928"],
+      "environment": {"CREDENTIALS_FILE": "/run/secrets/credentials", "MAX_SCAN_ROWS": "60"},
+      "secrets": ["credentials"],
+      "volumes": ["vpn_data:/data"],
+      "networks": ["vpn_private"],
+      "pids_limit": 128,
+      "mem_limit": "512m",
+      "healthcheck": {
+        "test": ["CMD", "python3", "/app/healthcheck.py"],
+        "interval": "30s", "timeout": "5s", "retries": 3, "start_period": "60s"
+      },
+      "logging": {"driver": "json-file", "options": {"max-size": "2m", "max-file": "2"}}
+    }
+  },
+  "secrets": {"credentials": {"file": "./secrets/credentials.json"}},
+  "volumes": {"vpn_data": {}},
+  "networks": {"vpn_private": {"driver": "bridge"}}
+}

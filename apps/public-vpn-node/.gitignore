@@ -1,0 +1,29 @@
+.env
+.env.*
+!.env.example
+secrets/
+data/
+runtime/
+reference/
+*.log
+*.key
+*.pem
+*.ovpn
+__pycache__/
+
+# 认证及运行产物（仅防误提交/误入构建上下文）
+*.p12
+*.pfx
+*.jks
+*.secret
+*credentials*.json
+*cookies*.txt
+.auth/
+*.pyc
+.test-work/
+
+# Local tooling and authentication artifacts
+.agents/
+.codex/
+.ssh/
+*.session

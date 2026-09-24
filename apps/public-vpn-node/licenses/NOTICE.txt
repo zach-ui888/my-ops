@@ -1,0 +1,18 @@
+public-vpn-node 本地安全改版，修改日期 2026-09-24。
+SPDX-License-Identifier: GPL-3.0-or-later
+来源：woyaozuofeiji/vpngate-docker
+上游 commit：14b803685e67b7d50deff8ee768d042d96dcaab1
+上游源码内部名称：AimiliVPN；部分 URL 指向 baoweise-bot/aimili-vpngate。
+app/vpngate_manager.py、app/proxy_server.py、app/vpn_utils.py 来自上述版本并经修改。
+原样保留收到的上游声明于 UPSTREAM-LICENSE.txt；其中省略的正文不作为完整许可证。
+完整 GNU GPL v3 正文见 GPL-3.0.txt，逐字节复制自宿主机预先提供的
+reference/GPL-3.0.txt；本次没有联网获取或修改 reference/。
+本项目及新增代码按 GPL-3.0-or-later 提供，保留选择以后版本的权利。
+许可证文档的 FSF 版权不代表项目代码的作者归属；不移除原有版权与许可声明。
+本程序不提供任何担保，包括适销性或特定用途适用性的默示担保，详见完整许可证。
+修改包括认证、配置白名单、代理 TCP/DNS 防泄漏、动态 TUN、fail-closed kill switch、
+fwmark policy routing、健康检查、OpenVPN 自动恢复及离线测试；详见 docs/源码审查.md、
+docs/续作记录.md 和 docs/上游文件指纹.json。
+最终 release-prep 仅补齐许可材料、清理行尾空白、增强发布检查和更新文档，保留已验收架构。
+分发时保留完整许可证、上游声明和修改通知，并按 GPL 提供对应源码及构建/安装材料；
+二进制或镜像交付另须满足相应的源码提供要求。
