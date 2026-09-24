@@ -1085,27 +1085,32 @@ def validate_git_publish_state(
 def validate_staged_scope(
     task_id,
     repo_root="/root/my-ops",
+    plan=None,
 ):
     """
     二次验证 Git staging area。
 
-    staging 中出现的每一个路径都必须属于当前 Task manifest。
+    staging 中出现的每一个路径都必须属于当前 Approval plan，
     不允许夹带任何其它文件。
 
-    注意：
-    Task manifest 中的目录不会作为 Git entry 出现，
+    首次完整发布时必须复用 staging 开始前生成的 plan。
+    原因是 staging 过程中会创建 apps/<project>，如果此时重新
+    build_approval_plan()，新项目可能被错误识别为已有项目，
+    从 initial publish 切换成普通增量模式。
+
+    Task plan 中的目录不会作为 Git entry 出现，
     因此 expected 只统计 file 类型的 before/after entry。
     """
     task_id = validate_task_id(task_id)
-
-    plan = build_approval_plan(
-        task_id,
-        repo_root=repo_root,
-    )
-    project = plan["project"]
-
     repo_root = Path(repo_root).resolve()
 
+    if plan is None:
+        plan = build_approval_plan(
+            task_id,
+            repo_root=repo_root,
+        )
+
+    project = plan["project"]
     expected = set()
 
     for item in plan["changes"]:
@@ -1140,6 +1145,8 @@ def validate_staged_scope(
     result = subprocess.run(
         [
             "git",
+            "-c",
+            "core.quotePath=false",
             "-C",
             str(repo_root),
             "diff",
@@ -1158,15 +1165,24 @@ def validate_staged_scope(
         if line.strip()
     }
 
-    unexpected = sorted(
-        staged - expected
-    )
+    unexpected = sorted(staged - expected)
 
     if unexpected:
         raise RuntimeError(
             "Staged scope violation: unexpected paths: "
             + json.dumps(
                 unexpected,
+                ensure_ascii=False,
+            )
+        )
+
+    missing = sorted(expected - staged)
+
+    if missing:
+        raise RuntimeError(
+            "Staged scope violation: expected paths missing: "
+            + json.dumps(
+                missing,
                 ensure_ascii=False,
             )
         )
@@ -1504,6 +1520,7 @@ def stage_task_for_approval(
     scope_check = validate_staged_scope(
         task_id,
         repo_root,
+        plan=plan,
     )
 
     staged = subprocess.run(
