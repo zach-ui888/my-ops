@@ -26,6 +26,8 @@ SNAPSHOT_IGNORE = {
     ".DS_Store",
     "venv",
     ".venv",
+    "secrets",
+    ".test-work",
 }
 
 TASK_ID_PATTERN = re.compile(
@@ -511,6 +513,9 @@ APPROVAL_BLOCKED_PARTS = {
     ".venv",
     "backup",
     "backups",
+    "secrets",
+    ".test-work",
+    "reference",
 }
 
 APPROVAL_BLOCKED_FILENAMES = {
@@ -591,7 +596,10 @@ def validate_approval_relative_path(relative):
             f"Blocked credential path: {relative}"
         )
 
-    if filename_lower.startswith(".env"):
+    if (
+        filename_lower.startswith(".env")
+        and filename_lower != ".env.example"
+    ):
         raise ValueError(
             f"Blocked environment file: {relative}"
         )
@@ -607,7 +615,68 @@ def validate_approval_relative_path(relative):
     return relative
 
 
-def build_approval_plan(task_id):
+def is_approval_path_blocked(relative):
+    """
+    判断路径是否属于 Approval 固定禁止发布范围。
+
+    本函数只用于首次完整项目发布时过滤 After Snapshot。
+    普通增量 Approval 仍由 validate_approval_relative_path()
+    严格拒绝非法路径。
+    """
+    try:
+        validate_approval_relative_path(relative)
+        return False
+    except ValueError:
+        return True
+
+
+def build_initial_publish_changes(task_id):
+    """
+    为 Git 中尚不存在的新项目构建首次完整发布计划。
+
+    数据来源只能是 immutable After Snapshot。
+
+    固定禁止路径不会进入发布候选，例如：
+    - secrets/
+    - reference/
+    - .test-work/
+    - data/
+    - logs/
+    - venv/
+    - .env
+
+    .env.example 允许发布。
+    """
+    task_id = validate_task_id(task_id)
+
+    after_root = snapshot_path(
+        task_id,
+        "after",
+    )
+
+    after = scan_snapshot_tree(after_root)
+
+    changes = []
+
+    for relative in sorted(after):
+        if is_approval_path_blocked(relative):
+            continue
+
+        after_entry = after[relative]
+
+        changes.append(
+            {
+                "path": relative,
+                "change": "added",
+                "before": None,
+                "after": after_entry,
+            }
+        )
+
+    return changes
+
+
+def build_approval_plan(task_id, repo_root="/root/my-ops"):
     """
     构建 Approval 只读计划。
 
@@ -660,7 +729,20 @@ def build_approval_plan(task_id):
             "After snapshot does not exist"
         )
 
-    changes = build_change_manifest(task_id)
+    repo_root = Path(repo_root).resolve()
+
+    repo_project = (
+        repo_root
+        / "apps"
+        / project
+    )
+
+    initial_publish = not repo_project.exists()
+
+    if initial_publish:
+        changes = build_initial_publish_changes(task_id)
+    else:
+        changes = build_change_manifest(task_id)
 
     plan = []
 
@@ -717,6 +799,7 @@ def build_approval_plan(task_id):
             "pending",
         ),
         "change_count": len(plan),
+        "initial_publish": initial_publish,
         "changes": plan,
     }
 
@@ -758,24 +841,38 @@ SECRET_CONTENT_PATTERNS = [
             rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"
         ),
     ),
-    (
-        "credential_assignment",
-        re.compile(
-            rb"""(?ix)
-            \b
-            (?:api[_-]?key|access[_-]?token|auth[_-]?token|
-               bot[_-]?token|client[_-]?secret|password|
-               passwd|secret)
-            \b
-            \s*
-            [:=]
-            \s*
-            ["']?
-            [^\s"'#]{16,}
-            """
-        ),
-    ),
 ]
+
+
+CREDENTIAL_LITERAL_PATTERN = re.compile(
+    rb"""(?ix)
+    \b
+    (?:api[_-]?key|access[_-]?token|auth[_-]?token|
+       bot[_-]?token|client[_-]?secret|password|
+       passwd|secret)
+    \b
+    \s*
+    [:=]
+    \s*
+    (?P<quote>["'])
+    (?P<value>[^"'\r\n]{16,})
+    (?P=quote)
+    """
+)
+
+
+CREDENTIAL_TEST_MARKERS = (
+    b"fixture",
+    b"synthetic",
+    b"test-only",
+    b"test_only",
+    b"not-a-secret",
+    b"not_a_secret",
+    b"example",
+    b"placeholder",
+    b"dummy",
+    b"fake",
+)
 
 
 def scan_file_for_secrets(path):
@@ -800,10 +897,35 @@ def scan_file_for_secrets(path):
         if pattern.search(data):
             matches.append(rule_name)
 
+    # credential_assignment 只针对明确的硬编码字符串字面量。
+    #
+    # 动态来源，例如 getpass()、环境变量、配置读取、
+    # request/JSON 字段和函数参数，不应因为变量名叫
+    # password/secret 就被误判。
+    #
+    # 测试 fixture 使用明确的 synthetic/fixture/fake 等
+    # 标记时允许通过；高置信 token/private-key 规则仍由
+    # SECRET_CONTENT_PATTERNS 独立阻止。
+    for match in CREDENTIAL_LITERAL_PATTERN.finditer(data):
+        value = match.group("value")
+        value_lower = value.lower()
+
+        if any(
+            marker in value_lower
+            for marker in CREDENTIAL_TEST_MARKERS
+        ):
+            continue
+
+        matches.append("credential_assignment")
+        break
+
     return sorted(set(matches))
 
 
-def scan_approval_snapshot_for_secrets(task_id):
+def scan_approval_snapshot_for_secrets(
+    task_id,
+    repo_root="/root/my-ops",
+):
     """
     只扫描 Task manifest 中 After Snapshot 的新增/修改文件。
     删除文件无需扫描。
@@ -820,7 +942,10 @@ def scan_approval_snapshot_for_secrets(task_id):
     """
     task_id = validate_task_id(task_id)
 
-    plan = build_approval_plan(task_id)
+    plan = build_approval_plan(
+        task_id,
+        repo_root=repo_root,
+    )
     after_root = snapshot_path(task_id, "after")
 
     findings = []
@@ -973,7 +1098,10 @@ def validate_staged_scope(
     """
     task_id = validate_task_id(task_id)
 
-    plan = build_approval_plan(task_id)
+    plan = build_approval_plan(
+        task_id,
+        repo_root=repo_root,
+    )
     project = plan["project"]
 
     repo_root = Path(repo_root).resolve()
@@ -1075,7 +1203,10 @@ def stage_task_for_approval(
     """
     task_id = validate_task_id(task_id)
 
-    plan = build_approval_plan(task_id)
+    plan = build_approval_plan(
+        task_id,
+        repo_root=repo_root,
+    )
     project = plan["project"]
 
     # --------------------------------------------------------
@@ -1083,7 +1214,10 @@ def stage_task_for_approval(
     # 只扫描 immutable After Snapshot 中属于本 Task 的文件。
     # 错误信息只包含路径和规则名称，不包含 secret 原文。
     # --------------------------------------------------------
-    secret_scan = scan_approval_snapshot_for_secrets(task_id)
+    secret_scan = scan_approval_snapshot_for_secrets(
+        task_id,
+        repo_root=repo_root,
+    )
 
     if not secret_scan["safe"]:
         safe_findings = [
@@ -1107,6 +1241,7 @@ def stage_task_for_approval(
     live_check = check_live_matches_after(
         task_id,
         live_root,
+        changes=plan["changes"],
     )
 
     if not live_check["safe"]:
@@ -1896,19 +2031,107 @@ def check_reject_conflicts(task_id, project_path):
     }
 
 
-def check_live_matches_after(task_id, project_path):
+def check_live_matches_after(
+    task_id,
+    project_path,
+    changes=None,
+):
     """
-    通用安全检查：
+    Approval 安全检查：
 
-    验证当前 Live 项目中属于该 Task 的变更路径，
-    是否仍然与 Task After Snapshot 一致。
+    验证当前 Live 项目中待发布路径是否仍然等于
+    immutable Task After Snapshot。
 
-    Approve / Reject 都必须通过此检查。
+    - 普通增量发布：默认检查 Before -> After manifest。
+    - 首次完整发布：调用方传入完整 Approval plan，
+      检查所有实际待发布路径。
+
+    Reject 继续独立使用 check_reject_conflicts()。
     """
-    return check_reject_conflicts(
-        task_id,
-        project_path,
-    )
+    task_id = validate_task_id(task_id)
+
+    if changes is None:
+        changes = build_change_manifest(task_id)
+
+    project_root = Path(project_path).resolve()
+
+    if not project_root.exists():
+        raise FileNotFoundError(
+            f"Project does not exist: {project_root}"
+        )
+
+    if not project_root.is_dir():
+        raise NotADirectoryError(
+            f"Project is not a directory: {project_root}"
+        )
+
+    conflicts = []
+
+    for item in changes:
+        relative = validate_approval_relative_path(
+            item["path"]
+        )
+
+        expected_after = item["after"]
+        live_path = project_root / relative
+        live_state = inspect_live_path(live_path)
+
+        if expected_after is None:
+            if live_state is not None:
+                conflicts.append(
+                    {
+                        "path": relative,
+                        "reason": (
+                            "path_exists_but_task_after_deleted_it"
+                        ),
+                    }
+                )
+            continue
+
+        if live_state is None:
+            conflicts.append(
+                {
+                    "path": relative,
+                    "reason": "live_path_missing",
+                }
+            )
+            continue
+
+        if live_state.get("type") == "unsupported":
+            conflicts.append(
+                {
+                    "path": relative,
+                    "reason": "unsupported_live_path",
+                }
+            )
+            continue
+
+        if live_state.get("type") != expected_after.get("type"):
+            conflicts.append(
+                {
+                    "path": relative,
+                    "reason": "path_type_changed",
+                }
+            )
+            continue
+
+        if expected_after.get("type") == "file":
+            if (
+                live_state.get("sha256")
+                != expected_after.get("sha256")
+            ):
+                conflicts.append(
+                    {
+                        "path": relative,
+                        "reason": "file_content_changed",
+                    }
+                )
+
+    return {
+        "safe": not conflicts,
+        "change_count": len(changes),
+        "conflicts": conflicts,
+    }
 
 
 def reject_task_changes(task_id, project_path):
