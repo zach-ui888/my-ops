@@ -381,3 +381,47 @@ GitHub 保存程序和部署配置，但默认不保存：
     RESULT: HEALTHY
 
 才表示基础恢复检查通过。
+
+
+---
+
+# 账号切换新增章节 / 迁移说明
+
+本文件仅是账号切换候选的新增章节，不是完整正式 Agent README，不能独立用于灾备恢复。最终 Git 合并应以 GitHub HEAD 的旧正式 README 为主体，再合入本章节。现有正式 Task、Snapshot、审批、发布模块与运维说明继续保留。
+
+## 入口和认证事务
+
+- `/codex_login`：白名单私聊发起 runner 的官方 device auth。验证码仅发给发起者。
+- `/usage`：显示当前配置 runner 的账号、套餐、额度窗口、重置时间和数据年龄。刷新仍过期时明确显示 stale/不可用，不展示旧余额为当前额度，巡检不发送低额度告警。
+- device auth staging → validate → atomic replace：候选认证在同一 runner 的临时 CODEX_HOME 验证后原子替换，正式状态再次验证；换号失败保留旧认证。
+- transaction recovery：持久事务标记与原 inode 备份支持中断恢复；下一次取得锁时先恢复未完成事务。不要手工删除锁文件。
+- quota cutoff：认证修改时间和成功切换时间共同过滤旧账号快照，只读取该 runner 最新 session。绝对时间判断不受 TZ 影响。
+- 告警去重按非敏感认证世代隔离，登录成功重置状态；不持久化 token/JWT，也不向用户展示内部 account ID。
+
+认证、session、staging 和事务备份不得进入 Git、日志、Task 快照或发布包。禁止回退读取 root Codex session。原 Task 工作目录限制、安全 prompt、审批/拒绝/diff/task_status handler 保留。
+
+## 配置与迁移
+
+systemd 正式配置仍由 `/ops/conf/tg-codex-agent/.env` 通过 python-dotenv 加载，在导入 runner 模块之前完成；这只是路径说明，本次未读取该文件。
+
+| 配置 | 默认值 / 含义 |
+| --- | --- |
+| CODEX_RUNNER_USER | codex-runner；禁止 root，bridge 同时检查实际 UID 非零及用户名 |
+| CODEX_RUNNER_HOME | /home/codex-runner；派生 HOME 与 CODEX_HOME=.codex |
+| CODEX_RUNNER_BIN | /home/codex-runner/.local/bin/codex；非默认安装需显式配置 |
+| CODEX_EXEC_TIMEOUT | 3600 秒 |
+| CODEX_WORK_ROOT | /ops/apps；仅允许其内非受保护项目 |
+| QUOTA_SNAPSHOT_MAX_AGE | 900 秒 |
+| QUOTA_ALERT_THRESHOLD | 剩余 ≤ 10% |
+| QUOTA_CHECK_INTERVAL | 3600 秒，至少 60 秒 |
+| TZ | Asia/Shanghai；无效值回退 Asia/Shanghai，仅用于展示 |
+
+不要独立覆盖 HOME/CODEX_HOME。CLI、认证、session、quota 和 Task 全部通过同一配置 runner，项目 chown 使用该用户及其默认组。默认值保持已验收 runner 架构。
+
+迁移运行文件：bot.py、codex_runner.py、account_client.py、runner_bridge.py、account_core.py、quota.py、quota_display.py，以及新增的 runner_config.py。保留正式 task_manager.py、full_publish.py、依赖与服务权限模型。代码及父目录应由控制器管理，runner 可读但不能写 Agent。仅支持一个正式 Bot 实例，不运行绕过 bridge 的并行账号管理程序。
+
+登录保留独占入场和内核文件锁；Task 遇到短时 quota/status 锁最多等待 5 秒，超时安全失败。等待不会绕过登录锁；CLI 子进程继续继承锁。Task stdout 去除首尾空白，空输出有成功兜底；错误仅返回安全类别，不透传 stderr。Telegram 菜单注册失败仅记录固定 warning，Bot 继续启动。
+
+默认行为相对旧正式版的有意变化：账号与额度统一来自 runner；设备授权事务取代不安全认证替换；登录与 Task 互斥；拒绝旧账号及 stale 快照；额度展示动态窗口与账号信息。旧状态命令不再注册，使用 `/usage`。
+
+本轮仅做离线验证，未部署、未真实登录或换号、未执行 Git add/commit/push。完整结果见 RELEASE_PREP.md。最终 Git 合并需保留旧正式 README 主体和正式 Agent 其余模块。

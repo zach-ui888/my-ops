@@ -7,38 +7,15 @@ from pathlib import Path
 # 配置
 # ============================================================
 
-WORK_ROOT = Path(
-    os.getenv(
-        "CODEX_WORK_ROOT",
-        "/ops/apps",
-    )
-).resolve()
+from runner_config import runner_config
 
-RUNNER_USER = os.getenv(
-    "CODEX_RUNNER_USER",
-    "codex-runner",
-)
-
-RUNNER_HOME = Path(
-    os.getenv(
-        "CODEX_RUNNER_HOME",
-        "/home/codex-runner",
-    )
-).resolve()
-
-CODEX_BIN = Path(
-    os.getenv(
-        "CODEX_RUNNER_BIN",
-        "/home/codex-runner/.local/bin/codex",
-    )
-).resolve()
-
-CODEX_TIMEOUT = int(
-    os.getenv(
-        "CODEX_EXEC_TIMEOUT",
-        "3600",
-    )
-)
+# Compatibility exports; runtime validation also reads current configuration.
+_config = runner_config()
+WORK_ROOT = _config.work_root
+RUNNER_USER = _config.user
+RUNNER_HOME = _config.home
+CODEX_BIN = _config.binary
+CODEX_TIMEOUT = _config.timeout
 
 
 # Agent 自己的目录不能作为开发项目
@@ -52,6 +29,7 @@ PROTECTED_PROJECTS = {
 # ============================================================
 
 def validate_workdir(workdir):
+    WORK_ROOT = runner_config().work_root
     path = Path(workdir).resolve()
 
     if not path.exists():
@@ -140,113 +118,5 @@ def run_codex(
     workdir,
     user_prompt,
 ):
-    workdir = validate_workdir(
-        workdir
-    )
-
-    if not CODEX_BIN.exists():
-        raise RuntimeError(
-            f"Codex CLI 不存在：{CODEX_BIN}"
-        )
-
-    prompt = build_prompt(
-        user_prompt
-    )
-
-    command = [
-        "runuser",
-        "-u",
-        RUNNER_USER,
-        "--",
-        "env",
-        f"HOME={RUNNER_HOME}",
-        f"CODEX_HOME={RUNNER_HOME / '.codex'}",
-        str(CODEX_BIN),
-        "exec",
-        "--sandbox",
-        "workspace-write",
-        "--skip-git-repo-check",
-        prompt,
-    ]
-
-    try:
-        result = subprocess.run(
-            command,
-            cwd=str(workdir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=CODEX_TIMEOUT,
-        )
-
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"Codex 执行超时：{CODEX_TIMEOUT} 秒"
-        )
-
-    if result.returncode != 0:
-        error_text = (
-            result.stderr.strip()
-            or result.stdout.strip()
-            or "unknown error"
-        )
-
-        raise RuntimeError(
-            "Codex 执行失败：\n"
-            + error_text[-4000:]
-        )
-
-    output = result.stdout.strip()
-
-    if not output:
-        output = "Codex 执行完成，但没有返回文本。"
-
-    return output
-
-
-# ============================================================
-# CLI 测试
-# ============================================================
-
-if __name__ == "__main__":
-    test_workdir = (
-        "/ops/apps/codex-test"
-    )
-
-    test_prompt = """
-Create a file named controller-runner-test.txt
-in the current project directory.
-
-Its content must be exactly:
-
-CONTROLLER_RUNNER_OK
-
-Then verify the file content.
-""".strip()
-
-    print(
-        "=== Restricted Codex Executor ==="
-    )
-
-    print(
-        f"Runner: {RUNNER_USER}"
-    )
-
-    print(
-        f"Workdir: {test_workdir}"
-    )
-
-    print()
-
-    output = run_codex(
-        test_workdir,
-        test_prompt,
-    )
-
-    print(
-        "=== Codex Output ==="
-    )
-
-    print(
-        output
-    )
+    from account_client import request
+    return request('task', workdir=str(validate_workdir(workdir)), prompt=user_prompt)['output']

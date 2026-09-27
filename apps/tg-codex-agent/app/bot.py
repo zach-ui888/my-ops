@@ -8,22 +8,33 @@ from pathlib import Path
 import subprocess
 
 from dotenv import load_dotenv
-from telegram import Update
+
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
 )
 
+ENV_FILE = "/ops/conf/tg-codex-agent/.env"
+load_dotenv(ENV_FILE)
+
+from runner_config import runner_config
+
 from codex_runner import (
     run_codex,
     validate_workdir,
 )
 
+from account_client import admission, request, status_text, login_flow, SafeError
+
 from quota import (
     build_usage_text,
-    get_rate_limits,
+    fetch,
+    require_fresh,
 )
+
+from quota_display import alert_window, alert_text
 
 from full_publish import publish_full_task_to_git
 
@@ -44,10 +55,6 @@ from task_manager import (
 # ============================================================
 # 基础配置
 # ============================================================
-
-ENV_FILE = "/ops/conf/tg-codex-agent/.env"
-
-load_dotenv(ENV_FILE)
 
 BOT_TOKEN = os.getenv(
     "TG_BOT_TOKEN",
@@ -165,6 +172,7 @@ def load_alert_state():
             state = json.load(f)
 
         return {
+            "generation": state.get("generation"),
             "primary_alerted": bool(
                 state.get(
                     "primary_alerted",
@@ -218,13 +226,11 @@ def save_alert_state(state):
 # ============================================================
 
 def calculate_quota():
-    (
-        rate_limits,
-        _session_file,
-        _snapshot_timestamp,
-    ) = get_rate_limits(
-        refresh_if_stale=True
-    )
+    result = fetch(refresh=True)
+    require_fresh(result)
+    rate_limits = result['rate_limits']
+    if any(rate_limits.get(k) is None for k in ('primary', 'secondary')):
+        raise RuntimeError('额度窗口未知')
 
     primary = (
         rate_limits.get("primary")
@@ -266,7 +272,10 @@ def calculate_quota():
     )
 
     return {
+        "generation": result["generation"],
         "plan": plan,
+        "identity": result["identity"],
+        "rate_limits": rate_limits,
         "primary_used": primary_used,
         "primary_left": primary_left,
         "secondary_used": secondary_used,
@@ -306,7 +315,7 @@ async def quota_monitor(context):
     )
 
     try:
-        quota = calculate_quota()
+        quota = await asyncio.to_thread(calculate_quota)
 
     except Exception:
         logger.exception(
@@ -315,6 +324,9 @@ async def quota_monitor(context):
         return
 
     state = load_alert_state()
+    generation_changed = state.get("generation") != quota.get("generation")
+    if generation_changed:
+        state.update(generation=quota.get("generation"), primary_alerted=False, secondary_alerted=False)
 
     primary_left = quota[
         "primary_left"
@@ -324,11 +336,11 @@ async def quota_monitor(context):
         "secondary_left"
     ]
 
-    changed = False
+    changed = generation_changed
     alert_messages = []
 
     # --------------------------------------------------------
-    # 5小时额度
+    # 第一额度窗口
     # --------------------------------------------------------
 
     if (
@@ -339,8 +351,7 @@ async def quota_monitor(context):
             "primary_alerted"
         ]:
             alert_messages.append(
-                "⏱ 5小时额度不足\n"
-                f"剩余：{primary_left:g}%"
+                alert_window(quota["rate_limits"]["primary"], "primary")
             )
 
             state[
@@ -360,11 +371,11 @@ async def quota_monitor(context):
             changed = True
 
             logger.info(
-                "5小时额度已恢复，解除告警状态"
+                "第一额度窗口已恢复，解除告警状态"
             )
 
     # --------------------------------------------------------
-    # 周额度
+    # 第二额度窗口
     # --------------------------------------------------------
 
     if (
@@ -375,8 +386,7 @@ async def quota_monitor(context):
             "secondary_alerted"
         ]:
             alert_messages.append(
-                "📅 周额度不足\n"
-                f"剩余：{secondary_left:g}%"
+                alert_window(quota["rate_limits"]["secondary"], "secondary")
             )
 
             state[
@@ -396,7 +406,7 @@ async def quota_monitor(context):
             changed = True
 
             logger.info(
-                "周额度已恢复，解除告警状态"
+                "第二额度窗口已恢复，解除告警状态"
             )
 
     # --------------------------------------------------------
@@ -413,17 +423,7 @@ async def quota_monitor(context):
     # --------------------------------------------------------
 
     if alert_messages:
-        text = (
-            "⚠️ Codex 额度告警\n\n"
-            f"套餐：{quota['plan'].capitalize()}\n\n"
-            + "\n\n".join(
-                alert_messages
-            )
-            + "\n\n"
-            f"告警阈值："
-            f"{QUOTA_ALERT_THRESHOLD}%\n\n"
-            "请检查 Codex 额度或切换账号。"
-        )
+        text = alert_text(quota['identity']['email'], alert_messages, QUOTA_ALERT_THRESHOLD)
 
         await send_to_allowed_users(
             context.application,
@@ -446,7 +446,14 @@ async def quota_monitor(context):
 # Codex Task 后台执行
 # ============================================================
 
-async def execute_codex_task(
+async def execute_codex_task(application, chat_id, task):
+    try:
+        await _execute_codex_task(application, chat_id, task)
+    finally:
+        admission.task_exit()
+
+
+async def _execute_codex_task(
     application,
     chat_id,
     task,
@@ -485,8 +492,8 @@ async def execute_codex_task(
 
                 shutil.chown(
                     workdir,
-                    user="codex-runner",
-                    group="codex-runner",
+                    user=runner_config().user,
+                    group=None,
                 )
 
                 logger.info(
@@ -632,11 +639,12 @@ async def start_command(
     await update.message.reply_text(
         "🤖 TG-Codex Agent 已连接\n\n"
         "Codex：受限执行模式已启用\n"
-        "执行用户：codex-runner\n"
+        f"执行用户：{runner_config().user}\n"
         "工作根目录：/ops/apps\n\n"
         "可用命令：\n"
         "/status - 查看系统状态\n"
-        "/usage - 查看 Codex 额度\n"
+        "/usage - 查看当前 Codex 账号和额度\n"
+        "/codex_login - 安全切换 ChatGPT 账号\n"
         "/disk - 查看服务器磁盘存储\n"
         "/task 项目名 开发需求 - 创建/继续 Codex 开发任务\n"
         "/task_status Task_ID - 查看任务状态\n"
@@ -673,7 +681,7 @@ async def status_command(
         "Telegram：已连接\n"
         "白名单：验证通过\n"
         "Codex：受限执行已启用\n"
-        "Codex 用户：codex-runner\n"
+        f"Codex 用户：{runner_config().user}\n"
         "Codex Task："
         f"{task_state}\n"
         "额度查询：已启用\n"
@@ -810,7 +818,7 @@ async def usage_command(
         return
 
     try:
-        text = build_usage_text(
+        text = await asyncio.to_thread(build_usage_text,
             threshold=QUOTA_ALERT_THRESHOLD,
             refresh_if_stale=True,
         )
@@ -889,50 +897,61 @@ async def task_command(
         )
         return
 
-    task = create_task(
-        user_id=update.effective_user.id,
-        project=project,
-        prompt=prompt,
-    )
-
-    task_id = task[
-        "task_id"
-    ]
-
-    logger.info(
-        "收到新 Task task_id=%s user_id=%s project=%s",
-        task_id,
-        update.effective_user.id,
-        project,
-    )
-
-    if TASK_LOCK.locked():
-        queue_text = (
-            "当前已有 Codex Task 正在执行。\n"
-            "本任务已创建，将等待前一个任务完成。"
-        )
-    else:
-        queue_text = (
-            "当前执行器空闲，任务即将开始。"
+    try:
+        admission.task_enter()
+    except SafeError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    scheduled = False
+    try:
+        task = create_task(
+            user_id=update.effective_user.id,
+            project=project,
+            prompt=prompt,
         )
 
-    await update.message.reply_text(
-        "📥 Codex Task 已接收\n\n"
-        f"Task：{task_id}\n"
-        f"项目：{project}\n"
-        f"状态：等待执行\n\n"
-        f"{queue_text}"
-    )
+        task_id = task[
+            "task_id"
+        ]
 
-    # 后台启动，不阻塞 Telegram handler。
-    asyncio.create_task(
-        execute_codex_task(
-            context.application,
-            update.effective_chat.id,
-            task,
-        ),
-        name=f"codex-task-{task_id}",
-    )
+        logger.info(
+            "收到新 Task task_id=%s user_id=%s project=%s",
+            task_id,
+            update.effective_user.id,
+            project,
+        )
+
+        if TASK_LOCK.locked():
+            queue_text = (
+                "当前已有 Codex Task 正在执行。\n"
+                "本任务已创建，将等待前一个任务完成。"
+            )
+        else:
+            queue_text = (
+                "当前执行器空闲，任务即将开始。"
+            )
+
+        await update.message.reply_text(
+            "📥 Codex Task 已接收\n\n"
+            f"Task：{task_id}\n"
+            f"项目：{project}\n"
+            f"状态：等待执行\n\n"
+            f"{queue_text}"
+        )
+
+        # 后台启动，不阻塞 Telegram handler。
+        asyncio.create_task(
+            execute_codex_task(
+                context.application,
+                update.effective_chat.id,
+                task,
+            ),
+            name=f"codex-task-{task_id}",
+        )
+        scheduled = True
+    finally:
+        if not scheduled:
+            admission.task_exit()
 
 
 # ============================================================
@@ -1463,6 +1482,51 @@ async def whoami_command(
 # Main
 # ============================================================
 
+async def codex_login_status_command(update, context):
+    if not is_allowed(update):
+        await deny(update)
+        return
+    try:
+        value = await asyncio.to_thread(request, 'status')
+        await update.message.reply_text(status_text(value))
+    except Exception:
+        await update.message.reply_text('登录状态暂不可用；执行器可能正在使用。')
+
+
+async def codex_login_command(update, context):
+    if not is_allowed(update):
+        await deny(update)
+        return
+    try:
+        admission.login_enter()
+    except SafeError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    try:
+        context.application.create_task(login_flow(update.message.reply_text, on_success=lambda: save_alert_state(default_alert_state())), update=update)
+    except Exception:
+        admission.login_exit()
+        await update.message.reply_text('未能启动登录流程。')
+
+
+COMMAND_MENU = (
+    ('start', '使用说明'), ('status', 'Agent 状态'),
+    ('whoami', '查看当前 Telegram 身份'), ('usage', '查看当前 Codex 账号和额度'),
+    ('codex_login', '切换 Codex 登录账号'),
+    ('task', '创建 Codex 开发任务'), ('task_status', '查看 Task 状态'),
+    ('diff', '查看 Task 变更'), ('approve', '审批 Task 变更'),
+    ('approve_full', '完整发布项目'), ('reject', '拒绝 Task 变更'),
+    ('disk', '查看服务器磁盘状态'),
+)
+
+
+async def register_commands(application):
+    try:
+        await application.bot.set_my_commands([BotCommand(name, description) for name, description in COMMAND_MENU])
+    except Exception:
+        logger.warning("Telegram 菜单注册失败；Bot 继续启动")
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
@@ -1503,6 +1567,7 @@ def main():
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .post_init(register_commands)
         .build()
     )
 
@@ -1582,6 +1647,8 @@ def main():
             whoami_command,
         )
     )
+
+    app.add_handler(CommandHandler("codex_login", codex_login_command))
 
     # 启动后 30 秒执行第一次额度巡检
     app.job_queue.run_repeating(
