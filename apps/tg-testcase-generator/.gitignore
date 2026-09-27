@@ -1,0 +1,68 @@
+/data/
+/runtime/
+/.test-runtime/
+output/
+
+# Local Python environments and bytecode
+.venv/
+venv/
+env/
+ENV/
+pycache/
+__pycache__/
+*.py[cod]
+
+# Python test and coverage artifacts
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local databases, including SQLite sidecars
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-journal
+*.db-wal
+*.db-shm
+*.tmp
+
+# Build artifacts
+*.egg-info/
+/build/
+/dist/
+
+# Local configuration and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Local authentication material must never be released
+.codex/
+.ssh/
+auth.json
+credentials.json
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Editor backups, temporary files and rotated logs
+*.temp
+*.swp
+*.swo
+*~
+*.bak
+*.log.*
