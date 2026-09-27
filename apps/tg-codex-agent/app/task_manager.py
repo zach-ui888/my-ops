@@ -1182,11 +1182,47 @@ def validate_staged_scope(
 
     missing = sorted(expected - staged)
 
-    if missing:
+    # Approval plan 可以包含项目运行时文件，而项目自己的
+    # .gitignore 会明确阻止这些文件进入 Git。
+    #
+    # missing 只有在 Git 明确认定该路径被 ignore 时才允许。
+    # 任何非 ignored 的 missing path 仍然属于 scope violation。
+    missing_not_ignored = []
+
+    for missing_path in missing:
+        ignored_check = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "check-ignore",
+                "-q",
+                "--",
+                missing_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if ignored_check.returncode == 0:
+            continue
+
+        if ignored_check.returncode == 1:
+            missing_not_ignored.append(
+                missing_path
+            )
+            continue
+
+        raise RuntimeError(
+            "Unable to verify Git ignore status for: "
+            + missing_path
+        )
+
+    if missing_not_ignored:
         raise RuntimeError(
             "Staged scope violation: expected paths missing: "
             + json.dumps(
-                missing,
+                missing_not_ignored,
                 ensure_ascii=False,
             )
         )
@@ -1201,6 +1237,91 @@ def validate_staged_scope(
         "expected": sorted(expected),
         "staged": sorted(staged),
     }
+
+
+
+def create_git_publish_backup(repo_project):
+    """
+    在 commit 前保存目标 Git 项目的完整工作区状态。
+
+    这里故意不使用 SNAPSHOT_IGNORE，也不依赖 .gitignore：
+    rollback 必须能够原样恢复发布前已经存在的 ignored 文件。
+    """
+    repo_project = Path(repo_project)
+
+    backup_root = (
+        BASE_DIR
+        / "data"
+        / "publish-backups"
+        / uuid.uuid4().hex
+    )
+    backup_project = backup_root / "project"
+
+    existed = repo_project.exists()
+
+    if existed:
+        info = repo_project.lstat()
+
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(
+                "Git project path is not a directory"
+            )
+
+        backup_root.mkdir(
+            parents=True,
+            exist_ok=False,
+        )
+
+        shutil.copytree(
+            repo_project,
+            backup_project,
+            symlinks=True,
+        )
+    else:
+        backup_root.mkdir(
+            parents=True,
+            exist_ok=False,
+        )
+
+    return {
+        "backup_root": backup_root,
+        "backup_project": backup_project,
+        "project_existed": existed,
+    }
+
+
+def restore_git_publish_backup(repo_project, backup):
+    """
+    恢复目标项目到本次 publish 开始前的完整工作区状态。
+
+    只操作目标项目目录，不清理其他项目。
+    Git index 由调用方另外 reset 到发布前 HEAD。
+    """
+    repo_project = Path(repo_project)
+
+    if repo_project.exists():
+        info = repo_project.lstat()
+
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(
+                "Refusing to remove non-directory Git project path"
+            )
+
+        shutil.rmtree(repo_project)
+
+    if backup["project_existed"]:
+        shutil.copytree(
+            backup["backup_project"],
+            repo_project,
+            symlinks=True,
+        )
+
+
+def remove_git_publish_backup(backup):
+    backup_root = Path(backup["backup_root"])
+
+    if backup_root.exists():
+        shutil.rmtree(backup_root)
 
 
 def stage_task_for_approval(
@@ -1487,6 +1608,23 @@ def stage_task_for_approval(
             )
 
     if changed_git_paths:
+        # Stage the project root instead of expanding every manifest entry
+        # into an explicit Git pathspec.
+        #
+        # Git does not track directories.  More importantly, an initial
+        # publish may legitimately contain directories/files ignored by the
+        # project's own .gitignore (for example local test/runtime output).
+        # Passing such an ignored path explicitly makes `git add` fail.
+        #
+        # Staging the project root lets Git apply its normal ignore rules and
+        # still stages additions, modifications and deletions.  The
+        # validate_staged_scope() check below remains the security boundary
+        # that prevents anything outside this Task's approval plan from
+        # being committed.
+        git_project_path = (
+            Path("apps") / project
+        ).as_posix()
+
         subprocess.run(
             [
                 "git",
@@ -1495,7 +1633,7 @@ def stage_task_for_approval(
                 "add",
                 "--all",
                 "--",
-                *changed_git_paths,
+                git_project_path,
             ],
             check=True,
         )
@@ -1734,38 +1872,54 @@ def publish_task_to_git(
         fetch=True,
     )
 
-    mark_publish_state(
-        task,
-        "staging",
+    baseline_head = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "rev-parse",
+            "HEAD",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    project = task["project"]
+    repo_project = (
+        repo_root
+        / "apps"
+        / project
+    )
+
+    publish_backup = create_git_publish_backup(
+        repo_project
     )
 
     try:
+        mark_publish_state(
+            task,
+            "staging",
+        )
+
         stage_result = stage_task_for_approval(
             task_id,
             repo_root,
             plan=plan,
         )
-    except Exception:
-        task = load_task(task_id)
-        clear_publish_state(task)
-        raise
 
-    # staging 完成后再次执行范围校验。
-    # 必须复用本次 staging 开始前生成的 Approval plan。
-    # 首次发布过程中 apps/<project> 已经被创建，如果这里重新
-    # build_approval_plan()，会错误地从 initial publish
-    # 切换为普通增量模式。
-    validate_staged_scope(
-        task_id,
-        repo_root,
-        plan=stage_result["plan"],
-    )
+        # staging 完成后再次执行范围校验。
+        # 必须复用本次 staging 开始前生成的 Approval plan。
+        validate_staged_scope(
+            task_id,
+            repo_root,
+            plan=stage_result["plan"],
+        )
 
-    commit_message = (
-        f"task: approve {task['project']} {task_id}"
-    )
+        commit_message = (
+            f"task: approve {task['project']} {task_id}"
+        )
 
-    try:
         subprocess.run(
             [
                 "git",
@@ -1779,12 +1933,70 @@ def publish_task_to_git(
             text=True,
             check=True,
         )
-    except subprocess.CalledProcessError as exc:
-        task = load_task(task_id)
-        clear_publish_state(task)
+
+    except Exception as exc:
+        rollback_error = None
+
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "reset",
+                    "--hard",
+                    baseline_head,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            restore_git_publish_backup(
+                repo_project,
+                publish_backup,
+            )
+
+            # restore 后再次确保 index 与基线 HEAD 一致。
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "reset",
+                    "--mixed",
+                    baseline_head,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+        except Exception as rollback_exc:
+            rollback_error = rollback_exc
+
+        finally:
+            # rollback 的正确性不依赖 backup 删除成功。
+            # 清理失败不能覆盖真正的 staging / commit 错误。
+            try:
+                remove_git_publish_backup(
+                    publish_backup
+                )
+            except Exception:
+                pass
+
+            task = load_task(task_id)
+            clear_publish_state(task)
+
+        if rollback_error is not None:
+            raise RuntimeError(
+                "Git publish failed before commit and "
+                "automatic rollback also failed"
+            ) from rollback_error
 
         raise RuntimeError(
-            "Git commit failed; Task remains pending"
+            "Git publish failed before commit; "
+            "repository was rolled back and Task remains pending"
         ) from exc
 
     commit_sha = subprocess.run(
@@ -1806,6 +2018,15 @@ def publish_task_to_git(
         "committed",
         git_commit=commit_sha,
     )
+
+    # commit 已经成为事实后，backup 清理失败不能破坏发布状态。
+    # Task 必须先记录 commit SHA，后续 push 才能安全恢复。
+    try:
+        remove_git_publish_backup(
+            publish_backup
+        )
+    except Exception:
+        pass
 
     try:
         subprocess.run(
