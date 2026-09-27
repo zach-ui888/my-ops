@@ -29,3 +29,6 @@ runtime/
 **/__pycache__/
 **/*.pyc
 !licenses/GPL-3.0.txt
+!app/ingress.py
+!app/ingress_guard.py
+!app/nft_support.py

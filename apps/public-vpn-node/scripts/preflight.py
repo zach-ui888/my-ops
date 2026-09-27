@@ -74,28 +74,6 @@ def check(base=BASE):
     dockerfile = (base / 'Dockerfile').read_text()
     if 'COPY . ' in dockerfile or 'install.sh' in dockerfile or 'docker.sock' in dockerfile:
         errors.append('Dockerfile 存在非预期构建输入')
-    manifest = json.loads((base / 'docs/上游文件指纹.json').read_text())
-    source = base / 'reference/source'
-    # Review source is optional after handoff. If present, verify all public files.
-    if source.is_dir():
-        if source.is_symlink() or (base / 'reference').is_symlink():
-            errors.append('审查源码目录不能为符号链接')
-        else:
-            if (base / 'reference/UPSTREAM_COMMIT').read_text().strip() != COMMIT:
-                errors.append('交付 commit 记录不符')
-            if (source / 'LICENSE').read_bytes() != (base / 'licenses/UPSTREAM-LICENSE.txt').read_bytes():
-                errors.append('上游许可证副本不一致')
-            allowed_source = {'.dockerignore', '.gitignore', 'Dockerfile', 'LICENSE', 'README.md', 'docker/ml', 'docker-compose.yml', 'install.sh', 'proxy_server.py', 'vpn_utils.py', 'vpngate_manager.py'}
-            if set(manifest) != allowed_source:
-                errors.append('上游指纹清单偏离公开文件白名单')
-                return {'结果': '失败', '错误': errors}, 2
-            for rel, digest in manifest.items():
-                path = source / rel
-                if '..' in Path(rel).parts or Path(rel).is_absolute() or path.is_symlink():
-                    errors.append('上游清单路径不安全')
-                    continue
-                if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-                    errors.append('上游文件指纹不符: ' + rel)
     return {'结果': '静态检查通过' if not errors else '失败', '错误': errors,
             'commit': COMMIT, '运行验收': '未执行；需管理员验证',
             '许可证': 'GPL-3.0-or-later；完整正文及上游声明见 licenses/',

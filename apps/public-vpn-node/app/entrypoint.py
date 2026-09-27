@@ -2,19 +2,58 @@
 import os
 import sys
 import security
+import nft_support
+
+
+def failure(stage, exc):
+    # Fixed vocabulary only: str(exc), argv, stderr, paths and values are unsafe.
+    reasons = {nft_support.NftCommandError: "nft-command-failed",
+               nft_support.NftInstallError: "nft-ruleset-install-failed",
+               nft_support.NftJSONError: "nft-json-invalid",
+               nft_support.NftMismatchError: "nft-readback-mismatch",
+               FileNotFoundError: "required-resource-missing",
+               PermissionError: "permission-denied",
+               ValueError: "invalid-configuration",
+               KeyError: "required-setting-missing",
+               OSError: "os-operation-failed",
+               RuntimeError: "runtime-initialization-failed"}
+    kind = type(exc) if type(exc) in reasons else Exception
+    reason = reasons.get(kind, "initialization-failed")
+    print(f"public-vpn-node: stage={stage} error={kind.__name__} reason={reason}; 拒绝启动。", flush=True)
+
+
+def require_verified(value):
+    if not value:
+        raise nft_support.NftMismatchError()
 
 
 def main():
     os.umask(0o077)
+    stage = "credentials.load"
     try:
         security.load_credentials()
+        stage = "firewall.install"
         import firewall
         firewall.install()
+        stage = "firewall.verify"
+        require_verified(firewall.verified())
+        if os.environ.get("PUBLIC_INGRESS") == "1":
+            stage = "ingress_guard.install"
+            import ingress_guard
+            ingress_guard.install()
+            stage = "ingress_guard.verify"
+            require_verified(ingress_guard.verified())
+        stage = "vpn_runtime.state_reset"
         import vpn_runtime
         vpn_runtime.STATE.unlink(missing_ok=True)
+        stage = "vpn_runtime.start_monitor"
         vpn_runtime.start_monitor()
-    except Exception:
-        print('public-vpn-node: 凭据校验或容器防泄漏规则安装失败；拒绝启动。', flush=True)
+        if os.environ.get("PUBLIC_INGRESS") == "1":
+            stage = "ingress.start"
+            import ingress
+            ingress.start()
+    except Exception as exc:
+        failure(stage, exc)
         return 1
     # No inherited upstream proxies or command override are permitted.
     for key in tuple(os.environ):

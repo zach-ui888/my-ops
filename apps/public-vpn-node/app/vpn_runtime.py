@@ -131,6 +131,10 @@ def event(process, line):
 
 def require_interface():
     with LOCK:
+        if os.environ.get("PUBLIC_INGRESS") == "1":
+            import ingress_guard
+            if not ingress_guard.verified():
+                raise OSError("Ingress guard unavailable")
         if (interface is None or owner is None or owner.poll() is not None or
                 tun_identity(interface[0]) != interface[1] or
                 not routing_valid(interface[0]) or not firewall.verified(interface[0])):

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "host": "YOUR_SERVER_PUBLIC_IPV4",
+  "port": 443,
+  "sni": "REPLACE_WITH_REVIEWED_TLS13_HOSTNAME",
+  "private_key": "GENERATED_LOCALLY_NEVER_COMMIT",
+  "public_key": "GENERATED_LOCALLY_SHARE_PRIVATELY",
+  "users": {
+    "alice": {"id": "GENERATED_INDEPENDENT_UUID", "short_id": "GENERATED_16_HEX", "enabled": true}
+  }
+}

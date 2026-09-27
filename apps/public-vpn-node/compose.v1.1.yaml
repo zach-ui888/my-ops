@@ -1,0 +1,29 @@
+{
+  "services": {
+    "vpn": {
+      "image": "public-vpn-node:1.1",
+      "ports": ["0.0.0.0:443:8443/tcp"],
+      "environment": {
+        "PUBLIC_INGRESS": "1",
+        "REALITY_TARGET": "${REALITY_TARGET:?Set a reviewed TLS1.3 target hostname}"
+      }
+    },
+    "ingress": {
+      "image": "ghcr.io/xtls/xray-core@sha256:592ec4d11f656db95598d01e76dbcc6e002d67360b96a5436500a938230f52c7",
+      "user": "65532:65532",
+      "network_mode": "service:vpn",
+      "depends_on": {"vpn": {"condition": "service_healthy", "restart": true}},
+      "entrypoint": ["/usr/local/bin/xray"],
+      "command": ["run", "-config", "/run/ingress/server.json"],
+      "restart": "unless-stopped",
+      "init": true,
+      "cap_drop": ["ALL"],
+      "security_opt": ["no-new-privileges:true"],
+      "read_only": true,
+      "volumes": ["./runtime/ingress:/run/ingress:ro"],
+      "pids_limit": 128,
+      "mem_limit": "256m",
+      "logging": {"driver": "none"}
+    }
+  }
+}

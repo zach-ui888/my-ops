@@ -1,144 +1,65 @@
-# public-vpn-node 中文部署与运维
+# public-vpn-node V1.1
 
-当前已完成最终 release-prep，保留此前已完成人工验收的 VPN 安全架构。本次只做离线复验与发布材料整理，不执行 Docker、不影响现有 VPN 容器、不修改宿主网络。53 项回归测试通过，完整 GPL v3 正文、NOTICE、发布排除与全文件空白检查已完成；结果见 [测试报告](docs/测试报告.md)。After Snapshot 文件指纹见 `docs/After-Snapshot.sha256`，供人工 Approval 后首次发布到 `my-ops/apps/public-vpn-node`；尚未提交、推送或部署。
+V1.1 在 V1.0 VPNGate、动态 tun、策略路由和 Kill Switch 上增加多用户 **VLESS + Reality + TCP / XTLS Vision** 公网入口。iPhone Shadowrocket 和使用 Mihomo 内核的 Clash Verge 可导入独立用户配置。根据发布负责人提供的真实环境验收结果，VLESS + Reality 公网 TCP 443、多用户 add/disable/enable/delete、VPNGate Kill Switch、VPN 断线 fail-closed、自动重连换节点、Docker 服务重启恢复及端口边界均已通过。本次发布收尾仅执行离线验证，不重复运行验收；宿主整机重启、Mihomo 等未明确提供的结果不扩大认定。历史报告与 After-Snapshot 仅代表 V1.0，不能作为本版发布证据。
 
-## 来源与上一阶段现场
+## 架构与边界
 
-固定上游 commit：`14b803685e67b7d50deff8ee768d042d96dcaab1`。
-来源项目为 `woyaozuofeiji/vpngate-docker`，内部名称 AimiliVPN。
-`reference/UPSTREAM_COMMIT` 记录该 SHA；`reference/source/` 是人工交付、只读的审查材料。文件指纹复核通过，不等同于重新验证 Git 对象。reference 不提交、不进入镜像、不作为运行目录，也不复制其 Git 元数据。
-
-上一 Task 已留下主要安全代码、Dockerfile、Compose、许可证副本和审查报告；README/测试报告却仍写“源码未取得”。本次沿用代码修补并更新文档，详见 [续作记录](docs/续作记录.md)、[源码审查](docs/源码审查.md)、[测试报告](docs/测试报告.md)。
-
-## 功能与安全边界
-
-应用显式使用本机代理 → 容器代理 → 当前实际 TUN 接口 → VPNGate 公共节点 → 目标站点。它不是宿主全局 VPN，也不是供外部客户端接入的 VPN 服务端。
-
-| 入口/组件 | 用途与限制 |
-| --- | --- |
-| `127.0.0.1:8787` | HTTP Web 管理，路径为管理员设置的 `/<secret_path>/`，需账号密码登录 |
-| `127.0.0.1:7928` | 同一 TCP 端口识别 HTTP/CONNECT 和 SOCKS5；强制独立代理账号密码 |
-| SOCKS5 | 只支持 CONNECT；使用 `socks5h` 由代理经隧道解析，未实现 UDP ASSOCIATE/BIND |
-| IPv4 | 业务目标仅允许公共 IPv4；拒绝回环、内网、链路本地、组播及 IPv6 |
-| Web | 获取/测试/选择节点、自动/国家/固定节点/收藏策略、出口检测、连接/断开；网页不能修改凭据或端口 |
-| 节点筛选 | 每轮默认最多 60 行候选，最多 5 路握手测试；国家限制影响选用，后台仍测试全部候选；IP 归属过滤只支持“所有 IP” |
-| 就绪检查 | 验证当前 TUN、OpenVPN 生命周期心跳、nftables、table 100、标记规则和监听端口；unhealthy 本身不会触发 Docker 重启 |
-
-容器内 root 运行，`cap_drop: ALL` 后只加 `NET_ADMIN`（TUN、路由、nft/SO_MARK）、`NET_RAW`（兼容 SO_BINDTODEVICE）。不使用 privileged、host network 或 docker.sock。只暴露 `/dev/net/tun`，使用独立 bridge、只读根文件系统、受限 tmpfs、专用 data 卷、只读 secret、no-new-privileges。容器内监听 0.0.0.0 用于 Docker 映射，宿主发布仅回环；同网络容器及宿主其他用户仍可能访问入口，认证不可省略。
-
-**Kill switch 保护代理 TCP 和代理 DNS，不是整容器默认拒绝。** 两类套接字发送前设置 SO_MARK 并绑定 当前实际 TUN 接口，nft output/postrouting 拒绝带该标记而出口不是 当前实际 TUN 接口 的包。安装规则失败先退出，不启动监听；设置标记/绑定失败关闭套接字；DNS 失败不走系统解析；策略路由安装失败终止连接。VPNGate HTTPS API 的系统 DNS、HTTPS 获取，以及公共节点 OpenVPN 传输/测速是明确的未标记控制面例外，用于无 VPN 时引导建连。宿主其他应用不受保护。尚不能静态证明内核断线、接口重建、已有 TCP 连接等全部行为，必须执行抓包验收。
-
-节点配置先重建白名单，拒绝脚本、plugin、额外 config、管理监听和自定义路由等指令；缓存使用前再校验并重新生成地址/路径。仅接受固定 HTTPS API，验证证书、拒绝重定向及 HTTP 降级。公共节点不可信，可能观察目标与明文业务；使用端到端 HTTPS，不承诺匿名性。
-
-## 目录
-
-- `app/`：三个修改后的上游模块及 security、firewall、entrypoint，镜像运行目录 `/app`。
-- `Dockerfile` / `compose.yaml`：独立安全部署；Compose 使用合法 YAML 的 JSON 子集。
-- `scripts/`：凭据配置、活性检查、离线验证及管理员验收辅助工具。
-- `docs/`：审查证据、测试报告、续作记录与人工验收。
-- `licenses/`：完整 GPL v3 正文、原样上游声明及修改通知。
-- `.env.example`：无真实秘密的说明；默认不需要 .env，密码不通过环境传入。
-- `secrets/`、命名卷 `/data`：由管理员部署时创建，不提交、不上传；不要复用上游旧数据卷。
-
-## 前置条件与凭据
-
-以下部署动作仅供已有 Docker 权限的 root 管理员，在批准后于本项目目录操作。受限开发用户不执行 Docker、不加入 docker 组、不调整 socket、不提权。管理员应确认 Linux Docker/Compose、TUN 和容器 nftables 支持，端口 8787/7928 空闲；不为本项目重配宿主 SSH、防火墙、DNS、路由或其他服务。此前运维状态未由本次会话复验。
-
-在管理员私密交互终端，关闭终端录制/调试追踪，用密码管理器生成五项值，然后执行：
-
-```bash
-cd /ops/apps/public-vpn-node
-python3 scripts/configure_credentials.py
+```mermaid
+flowchart LR
+  C[Shadowrocket / Clash Verge] -->|TCP 443 加密| X[Xray UID 65532 / 无 capabilities]
+  X -->|本机 SOCKS5 7928| P[原有认证代理]
+  X -->|Reality target 本机 9443| R[固定 TLS 目标转发器]
+  R --> G[统一 VPN 出站函数]
+  P --> G
+  G --> K[校验实际 tun / SO_MARK / SO_BINDTODEVICE / nft]
+  K --> T[当前 VPNGate tun]
+  T --> I[公共 IPv4 目标]
 ```
 
-工具隐藏输入并独占创建 `secrets/credentials.json`，目录 0700、文件 0600；存在即拒绝覆盖，不读取旧秘密，不回显。**由 root 管理员创建并持有文件**，否则在剥离 DAC_OVERRIDE 的容器内 root 可能无法读取其他 UID 的 0600 文件，不能靠放宽模式解决。
+- 公网只新增 **TCP 443**，映射容器 8443；不开放 UDP；V1.1 当前只支持 TCP ingress，客户端 UDP forwarding 必须关闭。8787、7928 仍仅宿主 `127.0.0.1`，管理使用 SSH Tunnel。9443 只监听容器回环。
+- 原有管理后台、HTTP/CONNECT、SOCKS5 CONNECT、VPNGate 获取/筛选/切换/自动重连保留。仅支持公共 IPv4 TCP 业务；UDP、IPv6、私网访问关闭。视频 QUIC 应回退 TCP；游戏、语音等 UDP 功能可能不可用。
+- Xray 唯一业务出站是现有 SOCKS5；无 freedom/DIRECT、内置 DNS、API、订阅服务。Reality 伪装连接也经 VPN。业务 DNS 在代理中经标记并绑定 tun 的 UDP 查询完成。
+- 每个用户有独立 UUID、独立 short ID，可新增、禁用、重新启用、删除。Reality 密钥对是服务器级材料，不是多人共用的 VLESS 用户凭据；Xray 不将 short ID 与 UUID 绑定，用户身份隔离以独立 UUID 为准。
+- 新增独立 nft `inet public_vpn_ingress`：约束 Xray UID 65532，只允许本机 7928/9443 和 8443 入站连接的 established **reply**。其余 IPv4/IPv6 TCP/UDP 均丢弃，不用宽泛的 established 放行。规则不匹配 OpenVPN root 控制进程。
+- 原有 `inet public_vpn_node` 继续检查 mark `0x56504e` 的 output/postrouting；table 100 指向当前实际 tun。连接前验证 tun 身份、路由及两套防火墙，失效不建连；监视器撤销已有 socket。节点切换重新绑定新 tun，客户端地址与凭据不变，旧连接需由应用重试。
+- 不信任 health healthy 作为安全结论。必须完成 [V1.1 部署、客户端与故障验收](docs/V1.1部署与验收.md)。
 
-| 字段 | 要求 |
-| --- | --- |
-| username、proxy_username | 各 4–64 位字母数字/下划线/连字符，建议不同 |
-| password、proxy_password | 各至少 20 位随机可打印 ASCII，无空白；建议不同，不用可预测口令 |
-| secret_path | 24–128 位随机字母数字；是额外路径保护，不能替代登录 |
+## 为什么采用 Reality
 
-最大长度 128；不接受空值、控制字符或 `REPLACE` 占位词。无内置管理/代理密码；缺失配置直接失败。VPNGate 的公开协议身份 vpn/vpn 与个人凭据无关。
+复用现有 SOCKS5 可保留已经实现的 tun 绑定和动态切换逻辑；Reality 满足公网加密及客户端兼容需求，无需增加证书自动续期入口。没有采用 UDP 传输协议，因为 V1.0 SOCKS5 未实现 UDP ASSOCIATE。选用标准 TCP/Vision，不引入较新的传输扩展。
 
-真实秘密不放入聊天、Git、README、.env.example、命令行参数或测试输出。只读挂载仍是明文文件，Docker 管理员与容器 root 可访问。管理会话使用密码学随机 token、内存保存、8 小时过期、最多 128 个；重启失效。Cookie 为 HttpOnly/SameSite=Strict；回环 HTTP 无 Secure 属性，不直接开放公网。
+Reality 对认证失败的连接会连接固定伪装目标，因此本版不允许它直接访问公网，专门经本机转发器送入 VPN；VPN 不可用时握手也可能失败。这是有意的 fail-closed 行为。配置依据：[Xray Reality](https://xtls.github.io/en/config/transports/reality.html)、[Mihomo VLESS](https://wiki.metacubex.one/config/proxies/vless/)。Reality target/SNI 必须在部署时显式配置，并先做 TLS 1.3 兼容性验证；`REALITY_TARGET` 必须与 `secrets/ingress.json` 中 ingress state 的 `sni` 一致。`www.apple.com` 是本次经真实 Shadowrocket 验证可用的示例，不是默认值或永久兼容保证。此前 Microsoft target 在当前 Xray 26.3.27 + REALITY 实现中出现 TLS record length 超过 8192 的兼容问题；不能据此认定 Microsoft 普遍不兼容。
 
-## 人工构建与验收入口
+## 快速导航
 
-先按 [完整人工 Docker 验收](docs/人工Docker验收.md) 逐项执行并记录结果。下列仅为起始命令，**本次未执行**：
-
-```bash
-cd /ops/apps/public-vpn-node
-bash scripts/verify.sh
-docker compose -p public-vpn-node config --quiet
-docker compose -p public-vpn-node build
-docker compose -p public-vpn-node up -d
-docker compose -p public-vpn-node ps
-```
-
-构建会访问 Docker 基础镜像及 Debian APT 仓库，不下载上游应用代码；没有 pip 依赖、远程安装器或自动更新。`debian:12-slim` 和 APT 版本未固定，管理员应记录 RepoDigests、镜像 ID 和包版本；尚未做依赖漏洞评估。网络受限时构建失败应停下，不改系统或降低 TLS 校验。
-
-## 日常访问与验证
-
-本机浏览器访问 `http://127.0.0.1:8787/<secret_path>/`，手工填入密码管理器保存的路径并登录；根路径返回 404 属于预期。远程管理只用既有 SSH 服务的本地端口转发，例如在管理员客户端执行以下模板（替换用户名和服务器，不改服务器 SSH 配置）：
-
-```bash
-ssh -N -L 127.0.0.1:18787:127.0.0.1:8787 -L 127.0.0.1:17928:127.0.0.1:7928 ADMIN@SERVER
-```
-
-随后客户端管理地址为 `http://127.0.0.1:18787/<secret_path>/`；代理为 `127.0.0.1:17928`。辅助验收脚本固定使用服务器本机 7928，应在服务器私密终端执行。
-
-```bash
-python3 scripts/probe_proxy.py --protocol http
-python3 scripts/probe_proxy.py --protocol socks5h
-python3 scripts/check_runtime_logs.py
-```
-
-探测工具隐藏输入代理账号/密码，经 curl stdin 传递认证，不用 argv/环境存密码；默认只输出退出码和公开出口 IP。未授权请求必须失败，两种协议成功后还须对照宿主出口和容器抓包。普通 HTTP 及代理认证在本地 HTTP/SOCKS5 通道不加密，远程访问应放在 SSH 隧道内；HTTPS 业务使用 CONNECT。
-
-网页日志接口返回空列表，容器仅输出固定生命周期消息，不输出路径、Cookie、密码或 OpenVPN 原始日志。日志工具只报告精确匹配及非预期日志行，不打印原文；最近 1000 行不能证明历史日志全部安全。网页登录错误与状态可供现场诊断，禁止导出带秘密的 HAR/配置/卷。
-
-## 停止、恢复与凭据轮换
-
-```bash
-docker compose -p public-vpn-node stop
-docker compose -p public-vpn-node start
-docker compose -p public-vpn-node restart
-```
-
-`restart: unless-stopped` 用于退出后的恢复；手动 stop 后不会随 Docker 重启自动恢复，需 start。容器使用 init 回收子进程；主进程处理 SIGTERM 清理活动连接。节点连接偏好保存在专用卷，重启需重新握手，期间代理应阻断；会话需重新登录。
-
-轮换凭据由管理员先 stop，在私密终端受控替换 secret（不在命令行写值、不输出旧文件），保持 root 所有和 0600/0700，然后 `docker compose -p public-vpn-node up -d --force-recreate`，重新测试认证与日志。配置工具只负责首次创建，避免自动覆盖。不可复用上游 ui_auth.json/旧卷作为迁移手段。
-
-开机恢复只在已有 Docker 自动启动机制下验证，不为此安装 systemd 单元或重启 Docker。宿主重启验收应并入管理员已批准的维护窗口，避免影响 tg-codex-agent 等服务；在该窗口之前将此项标记“未验收”。
-
-## 故障处理
-
-- 入口退出：检查凭据文件存在、拥有者/模式、TUN/capability、nft 内核支持；禁止临时 privileged/host network 绕过。
-- 没节点：检查控制面 API 可用性及 TLS；白名单、禁压缩、公共 IPv4 限制会降低节点兼容率，不自动放宽。
-- 代理请求失败：检查 Web 的连接状态与路由、当前实际 TUN 接口；healthcheck 会校验内核安全条件；远端站点可用性仍需代理实测。
-- DNS 失败：业务 DNS 固定经 当前实际 TUN 接口 到 8.8.8.8:53 UDP，只取 A 记录，拒绝截断/异常响应；无系统 DNS、TCP DNS 回退。节点封锁 DNS 时请求失败是预期关闭行为。
-- 断线期间仍成功：先检查是否已切换至另一条正常 VPN；以抓包为准。若发现业务明文走 eth0 或目标域名在控制面 DNS 出现，停止服务并判验收失败。
-- 代理/Web 线程故障：healthcheck 可报 unhealthy，但 Docker 不自动重启 unhealthy；管理员定位后重启本服务，不重启宿主 Docker。
-
-## 本地测试、升级与卸载
+- [部署、Shadowrocket/Clash 导入、用户管理、人工验收](docs/V1.1部署与验收.md)
+- `compose.yaml`：保留 V1.0 部署；`compose.v1.1.yaml`：显式叠加公网入口，不能单独运行。
+- `examples/ingress.example.json`：只有占位符的状态格式；不是可运行配置。
+- `scripts/ingress_users.py`：管理员本地生成密钥/用户和导出文件；不会运行 Docker 或联网。
+- `secrets/`：0700，用户数据库及导出 0600；`runtime/ingress/`：只读挂载给 Xray 的 0750/0640 配置，专用 GID 65532。真实材料全部排除 Git、构建与发布。
+- `app/ingress.py`、`app/ingress_guard.py`：固定目标转发及独立内核限制。
+- `scripts/verify.sh`：仅公开文件与模拟数据的离线验证，不读取 reference、真实凭据或运行数据。
 
 ```bash
 bash scripts/verify.sh
 ```
 
-验证只读取明确列出的公开源码/文档，不读取真实 .env、secret、会话、运行卷或密钥；只在项目 `.test-work/` 写 Python 编译缓存。敏感模式扫描不是泄密不存在的证明，人工 `/diff` 仍需复核。reference 指纹一致、忽略规则和 Dockerfile 白名单检查不等于已检查 Git 暂存区或实际 Docker 构建上下文；管理员提交前还须确认 reference 未纳入变更。
+本次开发仅在项目内修改和测试，未部署、未提权、未修改宿主防火墙、未重启服务或 Git commit/push。需要权限的动作只列于人工清单。当前交付目录没有 Git 仓库，不能报告 Git diff/暂存扫描已通过；公开文件扫描不能证明不存在任何未知格式秘密。
 
-升级固定版本并审查差异、依赖及许可后重新验收。本项目未保存已验收版本；今后保留已验收镜像 ID、Compose 及兼容数据备份供回滚。卸载只操作本项目，不执行全局 prune，不删除卷：
+## 运维和风险
 
-```bash
-docker compose -p public-vpn-node down
-```
+容器 VPN 仍以 root 加 NET_ADMIN/NET_RAW 运行，Xray 使用 UID 65532、cap_drop ALL、只读根文件系统、无 Docker socket。两者共享网络命名空间，不共享 PID/文件系统。管理员、Docker daemon、VPN 容器 root 与宿主内核属于信任边界；不能抵御管理员删除规则、恶意修改镜像或 VPN 控制面被攻陷。
 
-## 许可证与部署判定
+VPNGate 控制面 API、测速和 OpenVPN 外层连接仍可从 eth0 引导连接；这些不等于业务泄漏。公网加密入口不会使不可信 VPNGate 成为可信出口，业务仍须端到端 HTTPS。没有逐用户限速/配额、设备绑定或完备 DoS 防护，持有某用户完整导出的人可冒用该用户；撤销并重新创建可换凭据。
 
-项目保持 **GPL-3.0-or-later**：`licenses/GPL-3.0.txt` 为本地 `reference/GPL-3.0.txt` 的逐字节副本；`licenses/UPSTREAM-LICENSE.txt` 保留收到的省略版声明，`licenses/NOTICE.txt` 记录来源、修改日期、许可与担保声明。完整正文已加入 Docker 白名单，不需要发布 reference/。分发时保留这些材料并提供对应源码；镜像交付须另外落实 GPL 的源码提供要求。
+Docker 自动恢复依赖宿主已有 Docker 自启动；`unless-stopped` 不恢复人为 stop 的容器。新版本依赖镜像、Linux nft/conntrack、Reality 目标及客户端组合必须现场验证，不能将离线 mock 视作内核防泄漏证明。
 
-本次 53 项离线测试通过，未复验真实运行环境；既有人工验收结论来自任务交接，不能把 mock 测试视作新一轮抓包证据。动态 TUN、fail-closed kill switch、fwmark policy routing、健康检查、OpenVPN 断线自动恢复和 HTTP/SOCKS5 逻辑保持不变。控制面直连例外、公共 VPN 信任边界、未固定依赖等限制继续适用。
+固定上游来源：`woyaozuofeiji/vpngate-docker` commit `14b803685e67b7d50deff8ee768d042d96dcaab1`。保留 GPL-3.0-or-later 和 [许可证材料](licenses/NOTICE.txt)。本次不读取或修改 `reference/`。
 
-当前目录无 Git 仓库，After Snapshot 使用公开文件白名单和 SHA-256 描述；全文件执行 `git diff --no-index --check`，没有关闭空白检测。发布时只使用清单文件和清单本身，不要整目录打包；secrets/、reference/、.test-work/、data/、runtime/、日志及真实 .env 均排除。实际 Git 暂存区仍由人工首次导入时核对，禁止使用强制添加绕过忽略规则。满足进入人工 Approval 的离线条件，不代表已发布或重新部署。
+V1.1 / Shadowrocket 2.2.92 固定 **Xray 26.3.27 正式版**。镜像锁定与降级风险见
+[兼容版本审计](docs/Xray兼容版本审计.md)。root 已核验版本 26.3.27、平台 linux/amd64；Compose 与锁文件固定为
+`ghcr.io/xtls/xray-core@sha256:592ec4d11f656db95598d01e76dbcc6e002d67360b96a5436500a938230f52c7`；
+`XRAY_IMAGE` 不再生效。恢复部署前必须通过 `python3 scripts/check_xray_pin.py`，
+离线 verify 通过不等于真机兼容或部署就绪。本次不部署、不改变现有秘密与网络隔离。
+
+新服务器恢复不能只复制仓库：`secrets/ingress.json` 不进入 Git，需重新 init/add/render 或从独立安全备份恢复，详见 [恢复说明](docs/V1.1部署与验收.md#8-新服务器恢复)。

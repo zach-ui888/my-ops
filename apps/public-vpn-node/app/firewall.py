@@ -1,7 +1,7 @@
 """Container-only mark backstop; unmarked OpenVPN transport remains permitted."""
-import json
 import re
 import subprocess
+import nft_support
 
 MARK = 0x56504E
 TABLE = 'public_vpn_node'
@@ -24,27 +24,37 @@ def ruleset(interface=None):
 
 def install(interface=None):
     # Atomic replacement: None blocks ALL marked traffic, including existing flows.
-    subprocess.run(['nft', '-f', '-'], input=ruleset(interface), text=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   check=True, timeout=5)
+    nft_support.install(ruleset(interface))
 
 
-def verified(interface):
-    valid_interface(interface)
-    result = subprocess.run(['nft', '-j', 'list', 'table', 'inet', TABLE],
-                            capture_output=True, text=True, check=True, timeout=5)
-    entries = json.loads(result.stdout)['nftables']
+def verified(interface=None):
+    if interface is not None:
+        valid_interface(interface)
+    entries = nft_support.readback(TABLE)
+    try:
+        return matches(entries, interface)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+
+
+def matches(entries, interface):
+    if not nft_support.scoped(entries, TABLE):
+        return False
     expected = [
         {'match': {'op': '==', 'left': {'meta': {'key': 'mark'}}, 'right': MARK}},
         {'match': {'op': '!=', 'left': {'meta': {'key': 'oifname'}}, 'right': interface}},
         {'drop': None},
     ]
+    if interface is None:
+        del expected[1]
+    if sum('chain' in e for e in entries) != 2 or sum('rule' in e for e in entries) != 2:
+        return False
     for name in ('output', 'postrouting'):
         chains = [e['chain'] for e in entries if 'chain' in e and e['chain']['name'] == name]
         if len(chains) != 1 or any(chains[0].get(k) != v for k, v in
                                   {'type': 'filter', 'hook': name, 'prio': 0, 'policy': 'accept'}.items()):
             return False
         rules = [e['rule'] for e in entries if 'rule' in e and e['rule']['chain'] == name]
-        if len(rules) != 1 or [x for x in rules[0]['expr'] if 'counter' not in x] != expected:
+        if len(rules) != 1 or nft_support.expressions(rules[0]) != expected:
             return False
     return True

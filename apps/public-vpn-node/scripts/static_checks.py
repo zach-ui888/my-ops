@@ -8,6 +8,12 @@ import subprocess
 
 BASE = Path(__file__).resolve().parent.parent
 PUBLIC = [
+    'examples/xray.lock.json', 'scripts/check_xray_pin.py', 'scripts/test_xray_pin.py',
+    'docs/Xray兼容版本审计.md',
+    'app/nft_support.py', 'scripts/test_startup.py',
+    'compose.v1.1.yaml', 'examples/ingress.example.json',
+    'app/ingress.py', 'app/ingress_guard.py', 'scripts/ingress_users.py',
+    'scripts/test_ingress.py', 'docs/V1.1部署与验收.md',
     'README.md', 'Dockerfile', 'compose.yaml', '.env.example', '.gitignore', '.dockerignore',
     'app/vpn_runtime.py', 'scripts/test_vpn_runtime.py', 'app/entrypoint.py', 'app/firewall.py', 'app/security.py', 'app/vpn_utils.py',
     'app/proxy_server.py', 'app/vpngate_manager.py',
@@ -36,6 +42,8 @@ def docker_included(path, rules):
 
 def check():
     errors = []
+    from check_xray_pin import check as check_xray_pin
+    errors.extend(check_xray_pin())
     bodies = {}
     for rel in PUBLIC:
         path = BASE / rel
@@ -49,6 +57,8 @@ def check():
         return errors
     # Report only file/category, never a matching value or source line.
     patterns = {
+        '真实UUID': r'(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b',
+        'Reality密钥字面值': r'"(?:privateKey|private_key|public_key|public-key)"\s*:\s*"[A-Za-z0-9_-]{43}"',
         '私钥正文': r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----\s+[A-Za-z0-9+/=]{32}',
         '已知令牌格式': r'(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|AKIA[A-Z0-9]{16}|sk-proj-[A-Za-z0-9_-]{30,})',
         'URL 中的认证值': r'https?://[^\s/<>"\']+:[^\s/<>"\']+@',
@@ -78,7 +88,7 @@ def check():
                  'app/__pycache__/security.pyc', 'scripts/configure_credentials.py'):
         if docker_included(path, bodies['.dockerignore']):
             errors.append('构建上下文不应包含: ' + path)
-    for path in ('app/vpn_runtime.py', 'app/security.py', 'app/firewall.py', 'scripts/healthcheck.py', 'licenses/NOTICE.txt', 'licenses/UPSTREAM-LICENSE.txt', 'licenses/GPL-3.0.txt'):
+    for path in ('app/nft_support.py', 'app/vpn_runtime.py', 'app/security.py', 'app/firewall.py', 'scripts/healthcheck.py', 'licenses/NOTICE.txt', 'licenses/UPSTREAM-LICENSE.txt', 'licenses/GPL-3.0.txt'):
         if not docker_included(path, bodies['.dockerignore']):
             errors.append('构建上下文缺少: ' + path)
     for rel, body in bodies.items():

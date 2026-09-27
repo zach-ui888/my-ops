@@ -1,4 +1,6 @@
-# 管理员人工 Docker 验收（尚未执行）
+# 管理员人工 Docker 验收（V1.0 历史流程）
+
+V1.1 当前验收状态、Reality target/SNI 显式配置及 TLS 1.3 兼容性验证要求见 [V1.1 部署与验收](V1.1部署与验收.md)。新服务器必须按该文档恢复 ingress state；`secrets/ingress.json` 不进入 Git，需重新 init/add/render 或从独立安全备份恢复，`REALITY_TARGET` 必须与 state 的 `sni` 一致。V1.1 仅支持 TCP ingress，客户端关闭 UDP forwarding。
 
 > 最终 release-prep 更新（2026-09-24）：下文保留历史审查/验收流程。完整 GPL 正文现已从本地 reference/GPL-3.0.txt 补齐到 licenses/GPL-3.0.txt，旧的“许可证正文缺失”阻塞已解除。既有架构已由人工验收（依据任务交接）；本次未运行 Docker 或重做运行验收。最新离线结果及发布边界以 [测试报告](测试报告.md) 为准。
 
