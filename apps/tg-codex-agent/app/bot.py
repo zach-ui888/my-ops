@@ -1299,8 +1299,12 @@ async def approve_full_command(
         return
 
     commit = result.get("commit", "-")
-    pushed = result.get("pushed", False)
     change_count = result.get("full_change_count", "-")
+
+    if not result.get("approved"):
+        raise RuntimeError(
+            "Full Publish returned without approved state"
+        )
 
     await update.message.reply_text(
         "✅ Full Approve 完成\n\n"
@@ -1308,7 +1312,8 @@ async def approve_full_command(
         f"项目：{project}\n"
         f"完整发布变更：{change_count}\n"
         f"Commit：{commit}\n"
-        f"Push：{'成功' if pushed else '未完成'}"
+        "审批状态：approved\n"
+        "Push：成功"
     )
 
 
