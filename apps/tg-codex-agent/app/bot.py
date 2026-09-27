@@ -25,6 +25,8 @@ from quota import (
     get_rate_limits,
 )
 
+from full_publish import publish_full_task_to_git
+
 from task_manager import (
     TASK_LOCK,
     build_task_diff,
@@ -640,6 +642,7 @@ async def start_command(
         "/task_status Task_ID - 查看任务状态\n"
         "/diff Task_ID - 查看任务变更\n"
         "/approve Task_ID - 审批并发布到 GitHub\n"
+        "/approve_full Task_ID - 将最终 Task 完整发布到 GitHub\n"
         "/reject Task_ID - 拒绝并安全回滚\n"
         "/whoami - 查看当前 Telegram User ID\n\n"
         "项目名示例：public-vpn-node\n"
@@ -1193,6 +1196,122 @@ async def approve_command(
     )
 
 
+async def approve_full_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_allowed(update):
+        await deny(update)
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "用法：/approve_full <task_id>"
+        )
+        return
+
+    task_id = context.args[0].strip()
+
+    try:
+        task = load_task(task_id)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Task ID 格式无效。"
+        )
+        return
+
+    if not task:
+        await update.message.reply_text(
+            f"❌ Task 不存在：{task_id}"
+        )
+        return
+
+    if task.get("status") != "success":
+        await update.message.reply_text(
+            "❌ 只有执行成功的 Task 才能 Full Approve。\n\n"
+            f"Task：{task_id}\n"
+            f"当前状态：{task.get('status', 'unknown')}"
+        )
+        return
+
+    if task.get("approval_status", "pending") != "pending":
+        await update.message.reply_text(
+            "❌ 该 Task 已经处理过。\n\n"
+            f"Task：{task_id}\n"
+            "审批状态："
+            f"{task.get('approval_status', 'unknown')}"
+        )
+        return
+
+    project = task.get("project")
+
+    if not project:
+        await update.message.reply_text(
+            "❌ Task 缺少项目名称，无法 Full Approve。"
+        )
+        return
+
+    await update.message.reply_text(
+        "⏳ 正在执行 Full Publish 安全审批并发布到 GitHub...\n\n"
+        f"Task：{task_id}\n"
+        f"项目：{project}\n\n"
+        "将以该 Task 的最终 After Snapshot "
+        "与当前 Git HEAD 进行完整同步。\n"
+        "发布完成前请勿重复提交 Approve。"
+    )
+
+    try:
+        async with TASK_LOCK:
+            result = await asyncio.to_thread(
+                publish_full_task_to_git,
+                task_id,
+            )
+
+    except RuntimeError as exc:
+        logger.warning(
+            "Full Approve 被拒绝或发布失败 "
+            "task_id=%s error=%s",
+            task_id,
+            exc,
+        )
+
+        await update.message.reply_text(
+            "⚠️ Full Approve 未完成。\n\n"
+            f"Task：{task_id}\n"
+            f"项目：{project}\n"
+            f"原因：{str(exc)[:1000]}\n\n"
+            "Task 不会因为本次失败被错误标记为 approved。"
+        )
+        return
+
+    except Exception:
+        logger.exception(
+            "Full Approve 失败 task_id=%s",
+            task_id,
+        )
+
+        await update.message.reply_text(
+            "❌ Full Approve 执行异常。\n\n"
+            f"Task：{task_id}\n"
+            f"项目：{project}\n\n"
+            "Task 未被错误标记为 approved。"
+        )
+        return
+
+    commit = result.get("commit", "-")
+    pushed = result.get("pushed", False)
+    change_count = result.get("full_change_count", "-")
+
+    await update.message.reply_text(
+        "✅ Full Approve 完成\n\n"
+        f"Task：{task_id}\n"
+        f"项目：{project}\n"
+        f"完整发布变更：{change_count}\n"
+        f"Commit：{commit}\n"
+        f"Push：{'成功' if pushed else '未完成'}"
+    )
+
+
 async def reject_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1435,6 +1554,13 @@ def main():
         CommandHandler(
             "approve",
             approve_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "approve_full",
+            approve_full_command,
         )
     )
 

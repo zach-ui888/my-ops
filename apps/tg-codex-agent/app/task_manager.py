@@ -514,6 +514,7 @@ APPROVAL_BLOCKED_PARTS = {
     "backup",
     "backups",
     "secrets",
+    "runtime",
     ".test-work",
     "reference",
 }
@@ -925,6 +926,7 @@ def scan_file_for_secrets(path):
 def scan_approval_snapshot_for_secrets(
     task_id,
     repo_root="/root/my-ops",
+    plan=None,
 ):
     """
     只扫描 Task manifest 中 After Snapshot 的新增/修改文件。
@@ -942,10 +944,12 @@ def scan_approval_snapshot_for_secrets(
     """
     task_id = validate_task_id(task_id)
 
-    plan = build_approval_plan(
-        task_id,
-        repo_root=repo_root,
-    )
+    if plan is None:
+        plan = build_approval_plan(
+            task_id,
+            repo_root=repo_root,
+        )
+
     after_root = snapshot_path(task_id, "after")
 
     findings = []
@@ -1202,6 +1206,7 @@ def validate_staged_scope(
 def stage_task_for_approval(
     task_id,
     repo_root="/root/my-ops",
+    plan=None,
 ):
     """
     将单个 Task 的变更精确应用到 Git staging area。
@@ -1219,10 +1224,12 @@ def stage_task_for_approval(
     """
     task_id = validate_task_id(task_id)
 
-    plan = build_approval_plan(
-        task_id,
-        repo_root=repo_root,
-    )
+    if plan is None:
+        plan = build_approval_plan(
+            task_id,
+            repo_root=repo_root,
+        )
+
     project = plan["project"]
 
     # --------------------------------------------------------
@@ -1233,6 +1240,7 @@ def stage_task_for_approval(
     secret_scan = scan_approval_snapshot_for_secrets(
         task_id,
         repo_root=repo_root,
+        plan=plan,
     )
 
     if not secret_scan["safe"]:
@@ -1551,6 +1559,7 @@ def stage_task_for_approval(
 def publish_task_to_git(
     task_id,
     repo_root="/root/my-ops",
+    plan=None,
 ):
     """
     正式发布单个 Task 到 GitHub。
@@ -1734,6 +1743,7 @@ def publish_task_to_git(
         stage_result = stage_task_for_approval(
             task_id,
             repo_root,
+            plan=plan,
         )
     except Exception:
         task = load_task(task_id)
