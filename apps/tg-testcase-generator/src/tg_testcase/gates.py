@@ -11,6 +11,8 @@ class GenerationBlocked(ValueError):
 def gate(task, mode):
     validate(task)
     reasons = []
+    if task.pending_messages:
+        reasons.append("User messages pending review processor")
     if mode not in {"formal", "draft"}:
         reasons.append("Unknown generation mode")
     if task.state not in {State.READY, State.GENERATING}:

@@ -4,6 +4,7 @@ import sqlite3
 from uuid import uuid4
 
 from .models import State, Task
+from .migrations import migrate, register_outputs
 from .storage import atomic_write, inside_project, safe_name
 
 
@@ -30,6 +31,7 @@ class Store:
                     task_id TEXT NOT NULL, version INTEGER NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY(task_id, version));
             """)
+            migrate(conn)
 
     @contextmanager
     def _locked(self):
@@ -95,6 +97,7 @@ class Store:
                     raise VersionConflict("Stale task version")
                 action(task)
                 task.version += 1
+                register_outputs(conn, task)
                 conn.execute("UPDATE tasks SET state=?, version=?, payload=? WHERE id=?",
                              (task.state, task.version, task.dumps(), task.id))
                 conn.execute("INSERT INTO history VALUES (?, ?, ?)",

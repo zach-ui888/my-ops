@@ -12,7 +12,7 @@ from .storage import PROJECT, atomic_write, inside_project, safe_name
 
 
 class Engine:
-    """Application boundary. The future controller must supply trusted actor/chat IDs.
+    """Phase 1 offline compatibility API. Controllers must use Application.handle.
 
     Store and domain objects are trusted internal APIs, not an RPC interface.
     """
@@ -49,6 +49,7 @@ class Engine:
         task.confirmation = None
 
     def add_source(self, task_id, user_id, version, filename, data, critical=True, chat_type="private"):
+        # Compatibility path: offline callers retain immediate TextParser behavior.
         safe_name(filename)
         kind = Path(filename).suffix.lower().lstrip(".")
         if kind not in ALLOWED or not isinstance(data, bytes) or len(data) > MAX_SOURCE_BYTES:

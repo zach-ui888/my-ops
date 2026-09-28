@@ -120,6 +120,7 @@ class Task:
     confirmation: dict | None = None
     outputs: list[dict] = field(default_factory=list)
     recovery_note: str = ""
+    pending_messages: list[dict] = field(default_factory=list)
 
     def transition(self, target):
         if target not in TRANSITIONS[self.state]:

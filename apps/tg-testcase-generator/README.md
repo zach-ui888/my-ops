@@ -80,3 +80,7 @@ SQLite 与文件系统不是同一个事务。上传/导出文件先原子写入
 `Engine` 是未来 Controller 应调用的受控入口，用户身份/聊天类型必须来自可信传输层，不能取自需求文档。Store/domain 模块是内部可信 API，不应直接暴露给外部用户；白名单由调用方配置，本阶段无需任何 Token 或 `.env`。
 
 下一阶段建议先评审领域接口和结构化设计数据，再逐项实现解析适配器及完整性报告；其后在隔离测试环境接入私聊 Controller，并用真实业务资料验收。尚未达到完整 V1 产品验收。
+
+Phase 2 Step 1 的正式 Controller 边界为 `tg_testcase.Application.handle`。
+请求/响应 v1、事务去重、收集批次、迁移与离线兼容说明见 [协议文档](docs/PROTOCOL_V1.md)。
+`Engine.add_source` 保留 Phase 1 立即解析的离线 compatibility path；正式应用 append 只登记，finish_collection 冻结批次供后续 processor 处理。
