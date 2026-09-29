@@ -3,8 +3,8 @@ from io import StringIO
 
 CONTENT_SCHEMA_VERSION = 1
 MAX_BLOCKS = 20000
-PARSER_VERSION = 'offline-text/1'
-POLICY_VERSION = 'inert-utf8/1'
+PARSER_VERSION = 'offline-content/2'
+POLICY_VERSION = 'bounded-offline/2'
 
 
 def parse_content(source, blob=None, error=None):
@@ -18,6 +18,9 @@ def parse_content(source, blob=None, error=None):
     if error:
         result['issues'].append(dict(code=error, severity='error', locator=result['locator']))
         return result
+    if source['kind'] in {'pdf', 'docx', 'xlsx', 'png', 'jpg', 'jpeg'}:
+        from .complex_content import parse_complex
+        return parse_complex(result, blob, source['kind'])
     if source['kind'] not in {'text', 'txt', 'md'}:
         return parse_content(source, error='unsupported_parser')
     try:

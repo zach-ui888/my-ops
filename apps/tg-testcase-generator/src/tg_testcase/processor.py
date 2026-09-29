@@ -6,6 +6,7 @@ The worker API is trusted internal infrastructure, not an RPC boundary.
 import hashlib
 import json
 import time
+from threading import Event, Thread
 from pathlib import PurePosixPath
 
 from .content import parse_content, CONTENT_SCHEMA_VERSION, PARSER_VERSION, POLICY_VERSION
@@ -147,10 +148,10 @@ class Processor:
                     for key in ('content_schema_version', 'trust', 'source_id', 'origin', 'input', 'parser_version', 'policy_version', 'locator'):
                         if result.get(key) != expected[key]:
                             raise ValueError('Result identity mismatch')
-                    if result['status'] not in {'completed', 'failed'} or (result['status'] == 'completed') != (result['completeness'] == 'complete'):
+                    if result['status'] not in {'completed', 'partial', 'failed'} or (result['status'] == 'completed') != (result['completeness'] == 'complete'):
                         raise ValueError('Invalid result status')
                 count = sum(r['status'] == 'completed' for r in results)
-                status = 'completed' if count == len(results) else 'partial' if count else 'failed'
+                status = 'completed' if count == len(results) else 'partial' if any(r['status'] != 'failed' for r in results) else 'failed'
                 manifest = dict(content_schema_version=CONTENT_SCHEMA_VERSION, batch_id=claim['batch_id'],
                     task_id=task.id, status=status, trust='untrusted_source_data',
                     finalized_version=conn.execute('SELECT finalized_version FROM collection_batches WHERE id=?', (claim['batch_id'],)).fetchone()[0],
@@ -164,7 +165,7 @@ class Processor:
                     conn.execute('INSERT INTO sanitized_contents(batch_id,source_id,payload) VALUES(?,?,?)',
                                  (claim['batch_id'], result['source_id'], encode(result)))
                     source = by_id[result['source_id']]
-                    source.status = 'parsed' if result['status'] == 'completed' else 'failed'
+                    source.status = 'parsed' if result['status'] != 'failed' else 'failed'
                     source.complete = result['completeness'] == 'complete'
                     source.content = '\n'.join(b['text'] for b in result['blocks'])
                     source.failure = ','.join(i['code'] for i in result['issues'])
@@ -200,4 +201,24 @@ class Processor:
         claim = self.claim(batch_id, worker_id, lease_seconds)
         if claim is None:
             return None
-        return self.publish(claim, self.parse(claim))
+        stop = Event()
+        lost = []
+
+        def renew():
+            while not stop.wait(lease_seconds / 3):
+                try:
+                    self.heartbeat(claim, lease_seconds)
+                except Exception:
+                    lost.append(True)
+                    return
+
+        worker = Thread(target=renew, name='processor-heartbeat', daemon=True)
+        worker.start()
+        try:
+            results = self.parse(claim)
+        finally:
+            stop.set()
+            worker.join()
+        if lost:
+            raise LeaseLost('Heartbeat failed')
+        return self.publish(claim, results)
