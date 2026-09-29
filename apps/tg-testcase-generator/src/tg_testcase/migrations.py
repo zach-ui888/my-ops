@@ -1,7 +1,7 @@
 """Transactional, additive upgrades from the unversioned Phase 1 database."""
 from uuid import uuid5, NAMESPACE_URL
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def register_outputs(conn, task):
@@ -40,3 +40,35 @@ def migrate(conn):
             for (payload,) in conn.execute('SELECT payload FROM tasks').fetchall():
                 register_outputs(conn, Task.loads(payload))
             conn.execute('PRAGMA user_version=1')
+
+        if version <= 1:
+            conn.execute("ALTER TABLE collection_batches ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'pending'")
+            conn.execute("""CREATE TABLE source_inputs (
+                batch_id TEXT NOT NULL, source_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                locator TEXT NOT NULL, kind TEXT NOT NULL, origin TEXT NOT NULL,
+                sha256 TEXT, byte_length INTEGER, revision INTEGER NOT NULL,
+                PRIMARY KEY(batch_id, source_id))""")
+            conn.execute("""CREATE TABLE processing_runs (
+                batch_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL, attempt INTEGER NOT NULL,
+                fencing_token INTEGER NOT NULL, lease_until REAL NOT NULL,
+                status TEXT NOT NULL, result_digest TEXT)""")
+            conn.execute("""CREATE TABLE sanitized_contents (
+                batch_id TEXT NOT NULL, source_id TEXT NOT NULL, payload TEXT NOT NULL,
+                PRIMARY KEY(batch_id, source_id))""")
+            conn.execute("""CREATE TABLE batch_manifests (
+                batch_id TEXT PRIMARY KEY, payload TEXT NOT NULL)""")
+            conn.execute("""CREATE TABLE processing_staging (
+                batch_id TEXT PRIMARY KEY, fencing_token INTEGER NOT NULL, payload TEXT NOT NULL)""")
+            import json
+            from .models import Task
+            for bid, tid, ids in conn.execute(
+                    "SELECT id,task_id,source_ids FROM collection_batches").fetchall():
+                row = conn.execute('SELECT payload FROM tasks WHERE id=?', (tid,)).fetchone()
+                task = Task.loads(row[0])
+                sources = {source.id: source for source in task.sources}
+                for sid in json.loads(ids):
+                    source = sources[sid]
+                    conn.execute('INSERT INTO source_inputs VALUES (?,?,?,?,?,?,?,?,?)',
+                                 (bid, sid, tid, source.locator, source.kind, source.origin,
+                                  source.input_sha256, source.byte_length, source.revision))
+            conn.execute('PRAGMA user_version=2')

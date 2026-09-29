@@ -62,9 +62,9 @@ data/<store>/
 
 版本冲突抛出 `VersionConflict`；单用户约束冲突抛出 `sqlite3.IntegrityError`；门禁失败抛出含 reasons 的 `GenerationBlocked`。非法状态和数据抛出 `ValueError`，未授权抛出 `PermissionError`。
 
-SQLite 与文件系统不是同一个事务。上传/导出文件先原子写入，再提交数据库引用；崩溃可能留下未被 SQLite 引用的文件，这些文件保留，不能当作已发布产物。只有 `Task.outputs` 中的记录是成功产物。JSON 快照写入失败不会回滚已提交数据库，错误登记在 `Store.snapshot_errors`，可重试 `recover()`。SQLite 事务失败则不接受该状态版本。
+SQLite 与文件系统不是同一个事务。上传/导出文件先原子写入，再提交数据库引用；崩溃可能留下未被 SQLite 引用的文件，不能当作已发布产物。Step 2A 在启动 recover 时清理 UUID 命名的未登记来源文件，未登记输出仍保留。只有 `Task.outputs` 中的记录是成功产物。JSON 快照写入失败不会回滚已提交数据库，错误登记在 `Store.snapshot_errors`，可重试 `recover()`。SQLite 事务失败则不接受该状态版本。
 
-生成异常保留 generating 状态供恢复，不自动重试或假定用户已授权下一次生成。恢复不自动删除旧文件。备份应在停止写入后整体复制 Store 目录及正式模板；恢复时保持来源和输出路径不变，再调用 `recover()`。当前没有数据库跨版本迁移或备份调度器。
+生成异常保留 generating 状态供恢复，不自动重试或假定用户已授权下一次生成。恢复保留所有已登记来源、解析结果和输出。备份应在停止写入后整体复制 Store 目录及正式模板；恢复时保持来源和输出路径不变，再调用 `recover()`。当前支持数据库 schema 0→1→2 事务迁移，尚无备份调度器。
 
 路径限制以源码项目根目录为边界，拒绝现有符号链接；运行目录应由服务用户独占，不能允许不可信本地进程并发替换目录。此库不尝试实现对恶意本地文件系统管理员的隔离。当前支持 Linux 本地文件系统，不支持多主机共享存储部署。
 
@@ -84,3 +84,16 @@ SQLite 与文件系统不是同一个事务。上传/导出文件先原子写入
 Phase 2 Step 1 的正式 Controller 边界为 `tg_testcase.Application.handle`。
 请求/响应 v1、事务去重、收集批次、迁移与离线兼容说明见 [协议文档](docs/PROTOCOL_V1.md)。
 `Engine.add_source` 保留 Phase 1 立即解析的离线 compatibility path；正式应用 append 只登记，finish_collection 冻结批次供后续 processor 处理。
+
+
+## Phase 2 Step 2A 离线 Parser
+
+已实现冻结 batch 的离线 text/TXT/MD 处理，含 versioned sanitized content、SQLite schema 2、lease/fencing、原子发布与数据库 processing barrier。解析结果保持 REVIEW；不创建业务需求，不调用 AI。PDF/DOCX/XLSX/图片和真实外部服务仍未实现。
+
+接口、content schema、安全边界和恢复语义见 [Step 2A 交付说明](docs/PHASE2_STEP2A_DELIVERY.md)。
+
+```bash
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+python3 -m compileall -q src tests examples
+sha256sum templates/testcase_template.xlsx
+```

@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sanitized source content v1 (untrusted source data)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["content_schema_version", "trust", "source_id", "origin", "input", "parser_version", "policy_version", "locator", "status", "completeness", "blocks", "issues"],
+  "properties": {
+    "content_schema_version": {"const": 1},
+    "trust": {"const": "untrusted_source_data"},
+    "source_id": {"type": "string", "minLength": 1},
+    "origin": {"enum": ["telegram_text", "upload", "notion_reference", "legacy_unknown"]},
+    "input": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sha256", "byte_length", "revision"],
+      "properties": {
+        "sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "byte_length": {"type": ["integer", "null"], "minimum": 0},
+        "revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "parser_version": {"type": "string", "minLength": 1},
+    "policy_version": {"type": "string", "minLength": 1},
+    "locator": {"$ref": "#/$defs/locator"},
+    "status": {"enum": ["completed", "failed"]},
+    "completeness": {"enum": ["complete", "incomplete"]},
+    "blocks": {
+      "type": "array", "maxItems": 20000,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["type", "text", "trust", "locator"],
+        "properties": {
+          "type": {"const": "text"},
+          "text": {"type": "string"},
+          "trust": {"const": "untrusted_source_data"},
+          "locator": {
+            "allOf": [
+              {"$ref": "#/$defs/locator"},
+              {"required": ["line_start", "line_end", "paragraph"]}
+            ]
+          }
+        }
+      }
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["code", "severity", "locator"],
+        "properties": {
+          "code": {"type": "string", "minLength": 1},
+          "severity": {"enum": ["warning", "error"]},
+          "locator": {"$ref": "#/$defs/locator"}
+        }
+      }
+    }
+  },
+  "allOf": [{
+    "if": {"properties": {"status": {"const": "completed"}}},
+    "then": {
+      "properties": {
+        "completeness": {"const": "complete"},
+        "blocks": {"minItems": 1},
+        "input": {"properties": {"sha256": {"type": "string"}, "byte_length": {"type": "integer"}}}
+      }
+    },
+    "else": {
+      "properties": {
+        "completeness": {"const": "incomplete"},
+        "blocks": {"maxItems": 0},
+        "issues": {"minItems": 1}
+      }
+    }
+  }],
+  "$defs": {
+    "locator": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "source_id"],
+      "properties": {
+        "path": {"type": "string"},
+        "source_id": {"type": "string", "minLength": 1},
+        "line_start": {"type": "integer", "minimum": 1},
+        "line_end": {"type": "integer", "minimum": 1},
+        "paragraph": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

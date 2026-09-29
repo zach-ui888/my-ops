@@ -4,8 +4,8 @@ import sqlite3
 from uuid import uuid4
 
 from .models import State, Task
-from .migrations import migrate, register_outputs
-from .storage import atomic_write, inside_project, safe_name
+from .migrations import migrate, register_outputs, SCHEMA_VERSION
+from .storage import atomic_write, inside_project, safe_name, cleanup_sources
 
 
 class VersionConflict(ValueError):
@@ -21,6 +21,8 @@ class Store:
         inside_project(self.root / ".lock")
         self.snapshot_errors = []
         with self._locked() as conn:
+            if conn.execute('PRAGMA user_version').fetchone()[0] > SCHEMA_VERSION:
+                raise ValueError('Unsupported future database schema')
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS tasks (
                     id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
@@ -78,7 +80,21 @@ class Store:
         row = conn.execute("SELECT payload FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
             raise KeyError(task_id)
-        return Task.loads(row[0])
+        task = Task.loads(row[0])
+        Store._project_processing(conn, task)
+        return task
+
+    @staticmethod
+    def _project_processing(conn, task):
+        task.processing_barrier = [dict(batch_id=r[0], status=r[1]) for r in conn.execute(
+            "SELECT id, CASE WHEN status='open' THEN 'open' ELSE processing_status END "
+            "FROM collection_batches WHERE task_id=? AND status!='abandoned'", (task.id,))]
+
+    @staticmethod
+    def _discard_cancelled_staging(conn, task):
+        if task.state == State.CANCELLED:
+            conn.execute('DELETE FROM processing_staging WHERE batch_id IN '
+                         '(SELECT id FROM collection_batches WHERE task_id=?)', (task.id,))
 
     def get(self, task_id):
         safe_name(task_id)
@@ -96,6 +112,8 @@ class Store:
                 if task.version != version:
                     raise VersionConflict("Stale task version")
                 action(task)
+                self._project_processing(conn, task)
+                self._discard_cancelled_staging(conn, task)
                 task.version += 1
                 register_outputs(conn, task)
                 conn.execute("UPDATE tasks SET state=?, version=?, payload=? WHERE id=?",
@@ -122,6 +140,7 @@ class Store:
                                      (task.state, task.version, task.dumps(), task.id))
                         conn.execute("INSERT INTO history VALUES (?, ?, ?)",
                                      (task.id, task.version, task.dumps()))
+                cleanup_sources(self.directory(task.id) / 'source', {s.locator for s in task.sources})
                 self._snapshot(task)
                 recovered.append(task)
         return recovered

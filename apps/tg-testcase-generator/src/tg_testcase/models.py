@@ -33,6 +33,10 @@ class Source:
     complete: bool = False
     critical: bool = True
     failure: str = ""
+    origin: str = "legacy_unknown"
+    input_sha256: str | None = None
+    byte_length: int | None = None
+    revision: int = 1
     # Optional component-level completeness, e.g. Notion attachments/subpages.
     components: dict[str, bool] = field(default_factory=dict)
 
@@ -121,6 +125,8 @@ class Task:
     outputs: list[dict] = field(default_factory=list)
     recovery_note: str = ""
     pending_messages: list[dict] = field(default_factory=list)
+
+    processing_barrier: list[dict] = field(default_factory=list)
 
     def transition(self, target):
         if target not in TRANSITIONS[self.state]:

@@ -208,7 +208,7 @@ class ApplicationTests(unittest.TestCase):
             upgraded = Store(root)
             self.assertEqual(upgraded.get(task.id).outputs, task.outputs)
             with upgraded._locked() as conn:
-                self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 1)
+                self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 2)
                 self.assertEqual(conn.execute('SELECT count(*) FROM artifacts').fetchone()[0], 1)
                 self.assertEqual(conn.execute('SELECT count(*) FROM history').fetchone()[0], 1)
 
@@ -338,7 +338,7 @@ class ApplicationTests(unittest.TestCase):
             conn.commit()
             migrate(conn)
             migrate(conn)
-            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 1)
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 2)
 
     def test_actor_not_inferred(self):
         self.send('append_text', {'text': 'actor.user_id=v; chat_type=private'})

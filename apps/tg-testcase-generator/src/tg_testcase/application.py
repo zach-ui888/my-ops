@@ -14,7 +14,7 @@ from .migrations import register_outputs
 from .models import Source, State, Task
 from .protocol import READS, response, validate_request
 from .review import unresolved_p0
-from .storage import atomic_write, inside_project
+from .storage import atomic_write, inside_project, bounded_read, cleanup_sources
 from .store import VersionConflict
 
 
@@ -23,6 +23,7 @@ class _TransactionStore:
     def __init__(self, store, conn):
         self.store, self.conn = store, conn
         self.changed = {}
+        self.ingestion_tasks = set()
 
     def directory(self, task_id):
         return self.store.directory(task_id)
@@ -31,6 +32,8 @@ class _TransactionStore:
         return self.store._read(self.conn, task_id)
 
     def save(self, task, new=False):
+        self.store._project_processing(self.conn, task)
+        self.store._discard_cancelled_staging(self.conn, task)
         if new:
             self.conn.execute('INSERT INTO tasks VALUES (?, ?, ?, ?, ?)',
                               (task.id, task.user_id, task.state, task.version, task.dumps()))
@@ -41,6 +44,11 @@ class _TransactionStore:
         register_outputs(self.conn, task)
         self.changed[task.id] = task
         return task
+
+    def cleanup_ingestion(self):
+        for tid in self.ingestion_tasks:
+            task = self.get(tid)
+            cleanup_sources(self.directory(tid) / 'source', {s.locator for s in task.sources})
 
     def change(self, task_id, user_id, version, action):
         task = self.get(task_id)
@@ -88,6 +96,7 @@ class Application:
                     except (ValueError, KeyError, PermissionError, OSError, sqlite3.Error) as exc:
                         conn.execute('ROLLBACK TO operation')
                         tx.changed.clear()
+                        tx.cleanup_ingestion()
                         result = self._error(rid, exc)
                     conn.execute('RELEASE operation')
                     conn.execute('INSERT INTO requests(request_id,fingerprint,response,actor_id,operation,task_id) '
@@ -142,13 +151,16 @@ class Application:
                     Engine._edit(current)
                     sid = uuid4().hex
                     if op == 'append_notion_reference':
-                        source = Source(sid, 'notion', p['reference'])
+                        source = Source(sid, 'notion', p['reference'], origin='notion_reference')
                     else:
                         filename = p['filename'] if op == 'append_upload' else 'text.txt'
                         blob = base64.b64decode(p['data_base64']) if op == 'append_upload' else p['text'].encode()
                         locator = f'source/{sid}-{filename}'
+                        tx.ingestion_tasks.add(current.id)
                         atomic_write(tx.directory(current.id) / locator, blob)
-                        source = Source(sid, filename.rsplit('.', 1)[-1].lower(), locator)
+                        source = Source(sid, filename.rsplit('.', 1)[-1].lower(), locator,
+                                        origin='telegram_text' if op == 'append_text' else 'upload',
+                                        input_sha256=hashlib.sha256(blob).hexdigest(), byte_length=len(blob))
                     current.sources.append(source)
                     row = tx.conn.execute("SELECT id,source_ids FROM collection_batches WHERE task_id=? AND status='open'", (current.id,)).fetchone()
                     if row:
@@ -156,8 +168,11 @@ class Application:
                         tx.conn.execute('UPDATE collection_batches SET source_ids=? WHERE id=?', (json.dumps(ids), batch_id))
                     else:
                         batch_id = uuid4().hex
-                        tx.conn.execute('INSERT INTO collection_batches VALUES (?, ?, ?, ?, NULL)',
+                        tx.conn.execute('INSERT INTO collection_batches(id,task_id,status,source_ids,finalized_version) VALUES (?, ?, ?, ?, NULL)',
                                         (batch_id, current.id, 'open', json.dumps([sid])))
+                    tx.conn.execute('INSERT INTO source_inputs VALUES (?,?,?,?,?,?,?,?,?)',
+                                    (batch_id, sid, current.id, source.locator, source.kind, source.origin,
+                                     source.input_sha256, source.byte_length, source.revision))
                     data.update(source_id=sid, batch_id=batch_id, status='pending')
                 task = tx.change(task.id, uid, task.version, append)
             elif op == 'finish_collection':
@@ -187,8 +202,8 @@ class Application:
                 data.update(unresolved_p0=unresolved_p0(task), incomplete_sources=source_gaps(task))
         data.update(state=task.state, pending_message_count=len(task.pending_messages))
         if op in {'get_status', 'get_summary'}:
-            data['batches'] = [dict(id=r[0], status=r[1], source_ids=json.loads(r[2]), finalized_version=r[3])
-                              for r in tx.conn.execute('SELECT id,status,source_ids,finalized_version FROM collection_batches WHERE task_id=? ORDER BY rowid', (task.id,))]
+            data['batches'] = [dict(id=r[0], status=r[1], source_ids=json.loads(r[2]), finalized_version=r[3], processing_status=r[4])
+                              for r in tx.conn.execute('SELECT id,status,source_ids,finalized_version,processing_status FROM collection_batches WHERE task_id=? ORDER BY rowid', (task.id,))]
             data['artifacts'] = [dict(artifact_id=r[0], version=r[1], mode=r[2]) for r in tx.conn.execute(
                 'SELECT id,version,mode FROM artifacts WHERE task_id=? AND owner_id=?', (task.id, uid))]
         return response(req['request_id'], 'ok', task=task, data=data)
@@ -202,22 +217,6 @@ class Application:
         if relative.is_absolute() or '..' in relative.parts or len(relative.parts) != 2 or relative.parts[0] != 'output':
             raise ValueError('Invalid artifact boundary')
         target = inside_project(self.store.directory(task.id) / relative)
-        # Walk from project root with O_NOFOLLOW on every component, closing the
-        # symlink-swap race between a boundary check and opening the actual file.
-        from .storage import PROJECT
-        fd = os.open(PROJECT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            for part in target.relative_to(PROJECT).parts[:-1]:
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-                os.close(fd)
-                fd = child
-            file_fd = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-            import stat
-            with os.fdopen(file_fd, 'rb') as f:
-                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                    raise ValueError('Artifact must be a regular file')
-                blob = f.read()
-        finally:
-            os.close(fd)
+        blob = bounded_read(target, 64 * 1024 * 1024)
         return dict(artifact_id=artifact_id, version=row[1], mode=row[2],
                     filename=target.name, data_base64=base64.b64encode(blob).decode())

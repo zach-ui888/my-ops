@@ -107,3 +107,8 @@ Engine/Store/domain 为可信内部 API，不能直接向不可信 RPC 暴露。
 下一步实现离线 collection/review processor：消费冻结 batch、显式维护处理状态、解释待处理消息并提出可审查的规则更改。
 随后增加可信 Controller/Unix socket transport、真实上传下载和事件映射；Telegram、Notion 与模型集成不属于本步骤。
 应用生成执行/调度、恢复队列、artifact 流式传输、响应大小上限与持久化保留策略均需后续设计。
+
+
+## Step 2A 兼容扩展
+
+`get_status/get_summary` 的 batches 增加 `processing_status`；Collection 的 `status=finalized` 含义不变。`finish_collection` 仅冻结 batch，离线内部 `Processor` 消费后发布 content/manifest，Task 保持 review。text 与上传来源在登记时分别记录可信 `telegram_text`/`upload` origin 和原始指纹。processing barrier 对 formal/draft 都生效，不能通过 Engine.generate 绕过。详细 schema、迁移和恢复参见 [Step 2A](PHASE2_STEP2A_DELIVERY.md)。本次不增加 transport 或网络接口。

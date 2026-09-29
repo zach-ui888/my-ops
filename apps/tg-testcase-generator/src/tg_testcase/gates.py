@@ -11,6 +11,8 @@ class GenerationBlocked(ValueError):
 def gate(task, mode):
     validate(task)
     reasons = []
+    if any(b["status"] in {"open", "pending", "claimed", "processing"} for b in task.processing_barrier):
+        reasons.append("Collection processing pending")
     if task.pending_messages:
         reasons.append("User messages pending review processor")
     if mode not in {"formal", "draft"}:
