@@ -1,7 +1,7 @@
 """Transactional, additive upgrades from the unversioned Phase 1 database."""
 from uuid import uuid5, NAMESPACE_URL
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def register_outputs(conn, task):
@@ -72,3 +72,35 @@ def migrate(conn):
                                  (bid, sid, tid, source.locator, source.kind, source.origin,
                                   source.input_sha256, source.byte_length, source.revision))
             conn.execute('PRAGMA user_version=2')
+
+        if version <= 2:
+            conn.execute("ALTER TABLE collection_batches ADD COLUMN acquisition_status TEXT NOT NULL DEFAULT 'pending'")
+            conn.execute('ALTER TABLE collection_batches ADD COLUMN input_manifest_digest TEXT')
+            conn.execute('ALTER TABLE collection_batches ADD COLUMN inputs_sealed_at TEXT')
+            conn.execute('''CREATE TABLE source_fetch_runs (
+                batch_id TEXT NOT NULL, source_id TEXT NOT NULL, revision INTEGER NOT NULL,
+                worker_id TEXT NOT NULL, attempt INTEGER NOT NULL, fencing_token INTEGER NOT NULL,
+                lease_until REAL NOT NULL, status TEXT NOT NULL, outcome TEXT,
+                PRIMARY KEY(batch_id,source_id))''')
+            conn.execute('''CREATE TABLE source_packages (
+                id TEXT PRIMARY KEY, task_id TEXT NOT NULL, batch_id TEXT NOT NULL,
+                source_id TEXT NOT NULL, revision INTEGER NOT NULL,
+                reference_fingerprint TEXT NOT NULL, content_fingerprint TEXT NOT NULL,
+                package_digest TEXT NOT NULL, byte_length INTEGER NOT NULL,
+                outcome TEXT NOT NULL, payload TEXT NOT NULL,
+                UNIQUE(batch_id,source_id), UNIQUE(task_id,source_id,revision))''')
+            conn.execute('''CREATE TABLE source_package_artifacts (
+                package_id TEXT NOT NULL, artifact_id TEXT NOT NULL, kind TEXT NOT NULL,
+                path TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL, body BLOB NOT NULL,
+                PRIMARY KEY(package_id,artifact_id), UNIQUE(package_id,path))''')
+            conn.execute('''CREATE TABLE batch_input_manifests (
+                batch_id TEXT PRIMARY KEY, digest TEXT NOT NULL, payload TEXT NOT NULL)''')
+            for table in ('source_packages', 'source_package_artifacts', 'batch_input_manifests'):
+                for operation in ('UPDATE', 'DELETE'):
+                    conn.execute(f'''CREATE TRIGGER immutable_{table}_{operation.lower()}
+                        BEFORE {operation} ON {table} BEGIN
+                        SELECT RAISE(ABORT, 'Sealed inputs are immutable'); END''')
+            from .acquisition import seal_inputs
+            for (bid,) in conn.execute("SELECT id FROM collection_batches WHERE status='finalized' AND processing_status='pending'").fetchall():
+                seal_inputs(conn, bid)
+            conn.execute('PRAGMA user_version=3')

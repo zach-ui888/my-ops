@@ -93,6 +93,8 @@ class Store:
     @staticmethod
     def _discard_cancelled_staging(conn, task):
         if task.state == State.CANCELLED:
+            conn.execute("UPDATE source_fetch_runs SET status='abandoned' WHERE status!='sealed' AND batch_id IN (SELECT id FROM collection_batches WHERE task_id=?)", (task.id,))
+            conn.execute("UPDATE collection_batches SET acquisition_status='abandoned' WHERE acquisition_status!='sealed' AND task_id=?", (task.id,))
             conn.execute('DELETE FROM processing_staging WHERE batch_id IN '
                          '(SELECT id FROM collection_batches WHERE task_id=?)', (task.id,))
 

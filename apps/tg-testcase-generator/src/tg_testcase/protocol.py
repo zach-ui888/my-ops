@@ -10,7 +10,7 @@ from .storage import safe_name
 OPERATIONS = {
     'create_or_get_active', 'append_text', 'append_upload', 'append_notion_reference',
     'finish_collection', 'submit_user_message', 'get_status', 'get_summary',
-    'confirm_generation', 'cancel', 'reset', 'get_artifact',
+    'confirm_generation', 'cancel', 'reset', 'get_artifact', 'refresh_notion_source',
 }
 READS = {'get_status', 'get_summary', 'get_artifact'}
 
@@ -42,7 +42,7 @@ def validate_request(request):
     p = request['payload']
     fields = {'append_text': {'text'}, 'append_upload': {'filename', 'data_base64'},
               'append_notion_reference': {'reference'}, 'submit_user_message': {'text'},
-              'confirm_generation': {'text'}, 'get_artifact': {'artifact_id'}}.get(op, set())
+              'confirm_generation': {'text'}, 'get_artifact': {'artifact_id'}, 'refresh_notion_source': {'source_id'}}.get(op, set())
     if not isinstance(p, dict) or set(p) != fields:
         raise ValueError('Invalid payload fields')
     if any(not isinstance(v, str) or not v for v in p.values()):

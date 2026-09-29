@@ -1,0 +1,350 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Credential-free offline Notion source package v1",
+  "$comment": "Runtime validation additionally enforces UTF-8 byte budgets, credentials exclusion, graph depth, root binding, unique paths/IDs, aggregate budgets and hashes. JSON: 16 MiB, depth 24, 200000 values. No network schema resolution.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "package_id",
+    "task_id",
+    "batch_id",
+    "source_id",
+    "adapter_version",
+    "policy_version",
+    "api_version",
+    "revision",
+    "root",
+    "outcome",
+    "content_fingerprint",
+    "scope",
+    "artifacts",
+    "nodes",
+    "gaps"
+  ],
+  "properties": {
+    "schema": {
+      "const": "notion-source-package-v1"
+    },
+    "package_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+      "not": {
+        "pattern": "\\.\\."
+      }
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+      "not": {
+        "pattern": "\\.\\."
+      }
+    },
+    "batch_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+      "not": {
+        "pattern": "\\.\\."
+      }
+    },
+    "source_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+      "not": {
+        "pattern": "\\.\\."
+      }
+    },
+    "adapter_version": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+      "not": {
+        "pattern": "\\.\\."
+      }
+    },
+    "policy_version": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+      "not": {
+        "pattern": "\\.\\."
+      }
+    },
+    "api_version": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+      "not": {
+        "pattern": "\\.\\."
+      }
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "root": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "page",
+            "database",
+            "data_source"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^([0-9a-fA-F]{32}|[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})$"
+        }
+      }
+    },
+    "outcome": {
+      "enum": [
+        "completed",
+        "partial",
+        "failed"
+      ]
+    },
+    "content_fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "traversal_complete",
+        "pagination_complete",
+        "permissions_complete",
+        "view_semantics_resolved"
+      ],
+      "properties": {
+        "traversal_complete": {
+          "type": "boolean"
+        },
+        "pagination_complete": {
+          "type": "boolean"
+        },
+        "permissions_complete": {
+          "type": "boolean"
+        },
+        "view_semantics_resolved": {
+          "type": "boolean"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "kind",
+          "sha256",
+          "size",
+          "path"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+            "not": {
+              "pattern": "\\.\\."
+            }
+          },
+          "kind": {
+            "enum": [
+              "png",
+              "jpg",
+              "jpeg",
+              "pdf",
+              "docx",
+              "xlsx"
+            ]
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10485760
+          },
+          "path": {
+            "type": "string",
+            "pattern": "^artifacts/[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+            "not": {
+              "pattern": "\\.\\."
+            }
+          }
+        }
+      }
+    },
+    "nodes": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "type",
+          "parent_id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+            "not": {
+              "pattern": "\\.\\."
+            }
+          },
+          "type": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+            "not": {
+              "pattern": "\\.\\."
+            }
+          },
+          "parent_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+                "not": {
+                  "pattern": "\\.\\."
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "cells": {
+            "type": "array",
+            "maxItems": 512,
+            "items": {
+              "type": "string",
+              "maxLength": 65536
+            }
+          },
+          "artifact_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+            "not": {
+              "pattern": "\\.\\."
+            }
+          },
+          "expanded": {
+            "type": "boolean"
+          },
+          "page_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+            "not": {
+              "pattern": "\\.\\."
+            }
+          },
+          "table_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+            "not": {
+              "pattern": "\\.\\."
+            }
+          },
+          "data_source_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+            "not": {
+              "pattern": "\\.\\."
+            }
+          },
+          "property_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+            "not": {
+              "pattern": "\\.\\."
+            }
+          }
+        }
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "enum": [
+              "unknown_block",
+              "unsupported_block",
+              "reference_unresolved",
+              "relation_unresolved",
+              "synced_unresolved",
+              "view_semantics_unresolved",
+              "pagination_incomplete",
+              "permission_missing",
+              "resource_limit",
+              "external_attachment_rejected"
+            ]
+          },
+          "node_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+            "not": {
+              "pattern": "\\.\\."
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "completed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "scope": {
+            "properties": {
+              "traversal_complete": {
+                "const": true
+              },
+              "pagination_complete": {
+                "const": true
+              },
+              "permissions_complete": {
+                "const": true
+              },
+              "view_semantics_resolved": {
+                "const": true
+              }
+            }
+          },
+          "gaps": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ]
+}

@@ -161,6 +161,9 @@ class Application:
                         source = Source(sid, filename.rsplit('.', 1)[-1].lower(), locator,
                                         origin='telegram_text' if op == 'append_text' else 'upload',
                                         input_sha256=hashlib.sha256(blob).hexdigest(), byte_length=len(blob))
+                    count = tx.conn.execute("SELECT source_ids FROM collection_batches WHERE task_id=? AND status='open'", (current.id,)).fetchone()
+                    if count and len(json.loads(count[0])) >= 50:
+                        raise ValueError('Batch source limit')
                     current.sources.append(source)
                     row = tx.conn.execute("SELECT id,source_ids FROM collection_batches WHERE task_id=? AND status='open'", (current.id,)).fetchone()
                     if row:
@@ -175,6 +178,28 @@ class Application:
                                      source.input_sha256, source.byte_length, source.revision))
                     data.update(source_id=sid, batch_id=batch_id, status='pending')
                 task = tx.change(task.id, uid, task.version, append)
+            elif op == 'refresh_notion_source':
+                def refresh(current):
+                    Engine._edit(current)
+                    source = next((s for s in current.sources if s.id == p['source_id'] and s.kind == 'notion'), None)
+                    if source is None:
+                        raise ValueError('Unknown Notion source')
+                    if tx.conn.execute("SELECT 1 FROM collection_batches WHERE task_id=? AND (status='open' OR (status='finalized' AND processing_status NOT IN ('completed','partial','failed')))", (current.id,)).fetchone():
+                        raise ValueError('Finish active processing before refresh')
+                    source.revision += 1
+                    source.content, source.failure = '', ''
+                    source.status, source.complete = 'pending', False
+                    source.input_sha256, source.byte_length = None, None
+                    source.components = {}
+                    current.requirements, current.questions, current.answers = [], [], []
+                    current.rules, current.paths, current.cases = [], [], []
+                    bid = uuid4().hex
+                    tx.conn.execute('INSERT INTO collection_batches(id,task_id,status,source_ids) VALUES(?,?,?,?)',
+                                    (bid, current.id, 'open', json.dumps([source.id])))
+                    tx.conn.execute('INSERT INTO source_inputs VALUES(?,?,?,?,?,?,?,?,?)',
+                                    (bid, source.id, current.id, source.locator, source.kind, source.origin, None, None, source.revision))
+                    data.update(batch_id=bid, source_id=source.id, revision=source.revision, status='pending_collection')
+                task = tx.change(task.id, uid, task.version, refresh)
             elif op == 'finish_collection':
                 def finish(current):
                     Engine._edit(current)
@@ -183,6 +208,8 @@ class Application:
                         raise ValueError('No open collection batch')
                     tx.conn.execute("UPDATE collection_batches SET status='finalized',finalized_version=? WHERE id=?",
                                     (current.version + 1, row[0]))
+                    from .acquisition import seal_inputs
+                    seal_inputs(tx.conn, row[0])
                     if current.state == State.COLLECTING:
                         current.transition(State.REVIEW)
                     data.update(batch_id=row[0], source_ids=json.loads(row[1]), status='pending_processing')
@@ -202,8 +229,8 @@ class Application:
                 data.update(unresolved_p0=unresolved_p0(task), incomplete_sources=source_gaps(task))
         data.update(state=task.state, pending_message_count=len(task.pending_messages))
         if op in {'get_status', 'get_summary'}:
-            data['batches'] = [dict(id=r[0], status=r[1], source_ids=json.loads(r[2]), finalized_version=r[3], processing_status=r[4])
-                              for r in tx.conn.execute('SELECT id,status,source_ids,finalized_version,processing_status FROM collection_batches WHERE task_id=? ORDER BY rowid', (task.id,))]
+            data['batches'] = [dict(id=r[0], status=r[1], source_ids=json.loads(r[2]), finalized_version=r[3], processing_status=r[4], acquisition_status=r[5], input_manifest_digest=r[6], inputs_sealed_at=r[7])
+                              for r in tx.conn.execute('SELECT id,status,source_ids,finalized_version,processing_status,acquisition_status,input_manifest_digest,inputs_sealed_at FROM collection_batches WHERE task_id=? ORDER BY rowid', (task.id,))]
             data['artifacts'] = [dict(artifact_id=r[0], version=r[1], mode=r[2]) for r in tx.conn.execute(
                 'SELECT id,version,mode FROM artifacts WHERE task_id=? AND owner_id=?', (task.id, uid))]
         return response(req['request_id'], 'ok', task=task, data=data)

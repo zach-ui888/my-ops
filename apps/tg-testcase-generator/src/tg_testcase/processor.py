@@ -40,6 +40,21 @@ class Processor:
             task = self.store._read(conn, batch[0])
             if batch[1] != 'finalized' or task.state == State.CANCELLED or batch[2] in TERMINAL:
                 return None
+            from .acquisition import seal_inputs
+            # Legacy local inputs without recorded hashes are bounded and pinned before claim.
+            for source in self._inputs(conn, batch_id):
+                if source['kind'] != 'notion' and source['sha256'] is None:
+                    try:
+                        blob = self._read(source)
+                    except (OSError, ValueError):
+                        # Deterministic unavailable-input marker; processing reports failure.
+                        blob = None
+                    conn.execute('UPDATE source_inputs SET sha256=?,byte_length=? WHERE batch_id=? AND source_id=?',
+                                 (hashlib.sha256(blob if blob is not None else b'legacy-unavailable').hexdigest(),
+                                  len(blob) if blob is not None else 0, batch_id, source['source_id']))
+            seal_inputs(conn, batch_id)
+            if not conn.execute('SELECT input_manifest_digest FROM collection_batches WHERE id=?', (batch_id,)).fetchone()[0]:
+                return None
             now = self.clock()
             old = conn.execute('SELECT attempt,fencing_token,lease_until FROM processing_runs WHERE batch_id=?', (batch_id,)).fetchone()
             if old and old[2] > now:
@@ -76,7 +91,14 @@ class Processor:
     def _inputs(self, conn, bid):
         cursor = conn.execute('SELECT * FROM source_inputs WHERE batch_id=? ORDER BY rowid', (bid,))
         keys = [d[0] for d in cursor.description]
-        return [dict(zip(keys, r)) for r in cursor]
+        inputs = [dict(zip(keys, r)) for r in cursor]
+        for source in inputs:
+            if source['kind'] == 'notion':
+                package = conn.execute('SELECT content_fingerprint,byte_length FROM source_packages WHERE batch_id=? AND source_id=? AND revision=?',
+                                       (bid, source['source_id'], source['revision'])).fetchone()
+                if package:
+                    source['sha256'], source['byte_length'] = package
+        return inputs
 
     def _read(self, source):
         path = PurePosixPath(source['locator'])
@@ -108,7 +130,8 @@ class Processor:
         for source in inputs:
             try:
                 if source['kind'] == 'notion':
-                    result = parse_content(source, error='unsupported_parser')
+                    from .acquisition import OfflineAcquisition
+                    result = OfflineAcquisition(self.store).parse(source)
                 elif source['sha256'] is None or source['byte_length'] is None:
                     result = parse_content(source, error='input_verification_failed')
                 else:
@@ -154,6 +177,7 @@ class Processor:
                 status = 'completed' if count == len(results) else 'partial' if any(r['status'] != 'failed' for r in results) else 'failed'
                 manifest = dict(content_schema_version=CONTENT_SCHEMA_VERSION, batch_id=claim['batch_id'],
                     task_id=task.id, status=status, trust='untrusted_source_data',
+                    batch_input_fingerprint=conn.execute('SELECT input_manifest_digest FROM collection_batches WHERE id=?', (claim['batch_id'],)).fetchone()[0],
                     finalized_version=conn.execute('SELECT finalized_version FROM collection_batches WHERE id=?', (claim['batch_id'],)).fetchone()[0],
                     parser_version=PARSER_VERSION, policy_version=POLICY_VERSION,
                     processing_run=dict(claim), sources=[dict(source_id=r['source_id'], origin=r['origin'],

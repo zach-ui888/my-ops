@@ -183,7 +183,7 @@ class ProcessorTests(unittest.TestCase):
         self.send('append_notion_reference', {'reference': 'a' * 32})
         bid = self.send('finish_collection')['data']['batch_id']
         with patch.object(self.processor, '_read', side_effect=AssertionError('No local/network access')):
-            self.assertEqual(self.processor.process(bid, 'a')['status'], 'failed')
+            self.assertIsNone(self.processor.process(bid, 'a'))
 
     def test_fingerprint_manifest(self):
         blob = '中文'.encode()
@@ -561,6 +561,10 @@ class MigrationTests(unittest.TestCase):
         path = store.directory(task.id) / 'source/text.txt'
         path.write_bytes(b'legacy text')
         with store._locked() as conn, conn:
+            for table in ('source_fetch_runs', 'source_packages', 'source_package_artifacts', 'batch_input_manifests'):
+                conn.execute('DROP TABLE ' + table)
+            for column in ('acquisition_status', 'input_manifest_digest', 'inputs_sealed_at'):
+                conn.execute('ALTER TABLE collection_batches DROP COLUMN ' + column)
             for table in ('source_inputs', 'processing_runs', 'sanitized_contents', 'batch_manifests', 'processing_staging'):
                 conn.execute('DROP TABLE ' + table)
             conn.execute('ALTER TABLE collection_batches DROP COLUMN processing_status')
@@ -578,7 +582,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(proc.process('batch', 'a')['status'], 'completed')
         self.assertEqual(proc.result('batch')[1][0]['origin'], 'legacy_unknown')
         with store._locked() as conn:
-            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 2)
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 3)
 
     def test_one_to_two_failure_rolls_back(self):
         root, task = self.legacy()
@@ -629,4 +633,4 @@ class MigrationTests(unittest.TestCase):
         store = Store(self.root / 'new')
         Store(store.root)
         with store._locked() as conn:
-            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 2)
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 3)

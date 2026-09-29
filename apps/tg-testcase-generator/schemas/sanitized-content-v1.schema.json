@@ -130,7 +130,8 @@
         "properties": {
           "code": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "description": "Extensible nonempty processor/parser issue code, not the package gap allowlist. Converter-only codes: acquisition_partial, acquisition_failed, attachment_incomplete, issue_limit, empty_content. These cannot be supplied as package gaps."
           },
           "severity": {
             "enum": [
@@ -257,6 +258,63 @@
         },
         "image_format": {
           "type": "string"
+        },
+        "package_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+          "not": {
+            "pattern": "\\.\\."
+          }
+        },
+        "notion_page_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+          "not": {
+            "pattern": "\\.\\."
+          }
+        },
+        "notion_block_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+          "not": {
+            "pattern": "\\.\\."
+          }
+        },
+        "notion_table_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+          "not": {
+            "pattern": "\\.\\."
+          }
+        },
+        "notion_data_source_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+          "not": {
+            "pattern": "\\.\\."
+          }
+        },
+        "notion_property_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+          "not": {
+            "pattern": "\\.\\."
+          }
+        },
+        "attachment_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$",
+          "not": {
+            "pattern": "\\.\\."
+          }
+        },
+        "source_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "column_index": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     }
