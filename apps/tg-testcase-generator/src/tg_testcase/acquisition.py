@@ -91,14 +91,67 @@ class OfflineAcquisition:
         Validation failures leave fetching intact; a producer may submit a small
         failed package with an explicit gap, or retry with a new attempt.
         """
+        from io import BytesIO
+        require(type(raw) is bytes and type(artifacts) is dict, 'Invalid seal input')
+        require(all(type(b) is bytes for b in artifacts.values()), 'Invalid artifact bytes')
+        return self.seal_stream(claim, BytesIO(raw), len(raw),
+                                ((aid, BytesIO(b)) for aid, b in artifacts.items()))
+
+    def seal_stream(self, claim, package_stream, package_length, artifacts, *, staging=None):
+        """Consume (id, binary reader) pairs; never hold a DB lock during input."""
+        from .streaming import Staging, read_exact, CHUNK_SIZE
+        from .notion_package import MAX_JSON_BYTES
+        require(type(package_length) is int and 0 <= package_length <= MAX_JSON_BYTES,
+                'Package JSON size limit')
+        raw = read_exact(package_stream, package_length)
+        require(package_stream.read(1) == b'', 'Extra package bytes')
         p = load_package(raw)
-        require(type(artifacts) is dict and set(artifacts) == {a['id'] for a in p['artifacts']}, 'Artifact registry mismatch')
-        for a in p['artifacts']:
-            blob = artifacts[a['id']]
-            require(type(blob) is bytes and len(blob) == a['size'] and hashlib.sha256(blob).hexdigest() == a['sha256'], 'Artifact hash/size mismatch')
+        canonical_size = len(encode(p).encode())
+        require(canonical_size <= MAX_JSON_BYTES, 'Canonical package JSON size limit')
+        with self.store._locked() as conn:
+            source = self._check(conn, claim, {'fetching', 'sealed'})
+            require((p['task_id'], p['batch_id'], p['source_id'], p['revision']) ==
+                    (source[0], claim['batch_id'], claim['source_id'], claim['revision']),
+                    'Package binding mismatch')
+            require(reference_id(p['root']['id']) == reference_id(source[1]), 'Root reference mismatch')
+            if 'root_type' in claim:
+                require(p['root']['type'] == claim['root_type'], 'Root type mismatch')
+            used = conn.execute('SELECT coalesce(sum(byte_length),0) FROM source_packages WHERE batch_id=? AND source_id!=?',
+                                (claim['batch_id'], claim['source_id'])).fetchone()[0]
+            remaining = conn.execute("SELECT count(*) FROM source_inputs i WHERE i.batch_id=? AND i.kind='notion' AND i.source_id!=? AND NOT EXISTS (SELECT 1 FROM source_packages p WHERE p.batch_id=i.batch_id AND p.source_id=i.source_id)",
+                                     (claim['batch_id'], claim['source_id'])).fetchone()[0]
+            require(used + canonical_size + sum(a['size'] for a in p['artifacts']) + remaining * 4096
+                    <= MAX_BATCH_BYTES, 'Batch package limit')
+        with (staging or Staging(self.store.root)) as staged:
+            declared = {a['id']: a for a in p['artifacts']}
+            seen = set()
+            for aid, reader in artifacts:
+                require(aid in declared and aid not in seen, 'Artifact registry mismatch')
+                seen.add(aid)
+                a = declared[aid]
+                f = staged.create(aid)
+                size, sha = 0, hashlib.sha256()
+                while True:
+                    wanted = min(CHUNK_SIZE, a['size'] - size + 1)
+                    chunk = reader.read(wanted)
+                    require(type(chunk) is bytes and len(chunk) <= wanted, 'Invalid stream chunk')
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    require(size <= a['size'] and size <= MAX_ATTACHMENT, 'Artifact size mismatch')
+                    sha.update(chunk)
+                    f.write(chunk)
+                require(size == a['size'] and sha.hexdigest() == a['sha256'], 'Artifact hash/size mismatch')
+                f.flush()
+                f.seek(0)
+            require(seen == set(declared), 'Artifact registry mismatch')
+            return self._commit_staged(claim, p, staged)
+
+    def _commit_staged(self, claim, p, staged):
+        from .streaming import write_blob
         canonical = encode(p)
         package_digest = hashlib.sha256(canonical.encode()).hexdigest()
-        total = len(canonical.encode()) + sum(len(b) for b in artifacts.values())
+        total = len(canonical.encode()) + sum(a['size'] for a in p['artifacts'])
         with self.store._locked() as conn, conn:
             conn.execute('BEGIN IMMEDIATE')
             source = self._check(conn, claim, {'fetching'})
@@ -114,13 +167,12 @@ class OfflineAcquisition:
                          (p['package_id'], p['task_id'], p['batch_id'], p['source_id'], p['revision'],
                           reference_fingerprint(source[1]), p['content_fingerprint'], package_digest, total, p['outcome'], canonical))
             for a in p['artifacts']:
-                conn.execute('INSERT INTO source_package_artifacts VALUES(?,?,?,?,?,?,?)',
-                             (p['package_id'], a['id'], a['kind'], a['path'], a['sha256'], a['size'], artifacts[a['id']]))
+                write_blob(conn, p['package_id'], a, staged.files[a['id']])
             conn.execute("UPDATE source_fetch_runs SET status='sealed',outcome=? WHERE batch_id=? AND source_id=?", (p['outcome'], claim['batch_id'], claim['source_id']))
             seal_inputs(conn, claim['batch_id'])
         return dict(package_id=p['package_id'], package_digest=package_digest, content_fingerprint=p['content_fingerprint'])
 
-    def seal_failure(self, claim, code='acquisition_failed'):
+    def seal_failure(self, claim, code='acquisition_failed', *, root_type=None):
         """Seal a small failure receipt using registry identity, never rejected bytes.
 
         Useful after a package exceeds validation budgets. Invalid input is not
@@ -128,12 +180,14 @@ class OfflineAcquisition:
         """
         from uuid import uuid4
         from .notion_package import content_fingerprint, GAPS
+        root_type = root_type or claim.get('root_type', 'page')
+        require(root_type in {'page', 'database', 'data_source'}, 'Invalid root type')
         require(code in GAPS or code == 'acquisition_failed', 'Invalid failure code')
         with self.store._locked() as conn:
             source = self._check(conn, claim, {'fetching'})
         p = dict(schema='notion-source-package-v1', package_id=uuid4().hex,
                  task_id=source[0], batch_id=claim['batch_id'], source_id=claim['source_id'],
-                 revision=claim['revision'], root=dict(type='page', id=reference_id(source[1])),
+                 revision=claim['revision'], root=dict(type=root_type, id=reference_id(source[1])),
                  adapter_version='offline-failure-1', policy_version='scope-1', api_version='not-applicable',
                  outcome='failed', scope=dict(traversal_complete=False, pagination_complete=False,
                  permissions_complete=False, view_semantics_resolved=False), nodes=[], artifacts=[],
