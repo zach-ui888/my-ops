@@ -1,4 +1,4 @@
-"""Shared offline guard and short-lived commit decisions (not yet wired to seal)."""
+"""Shared guard and short-lived decisions used by the acquisition commit boundary."""
 from contextlib import contextmanager
 import fcntl
 import os
@@ -95,7 +95,7 @@ def authorize_commit(registry, job_id, claim, package_id, package_digest, now_ms
     """Internal port. The caller must retain guard through its DB COMMIT.
 
     Acquisition itself must also recheck owner/cancel/revision/root/budget and
-    lease/deadline immediately before commit (Step 2.2).
+    lease/deadline immediately before commit.
     """
     registry.guard.require_held()
     identifier(package_id); sha(package_digest)

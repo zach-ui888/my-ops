@@ -1,7 +1,7 @@
 """Transactional, additive upgrades from the unversioned Phase 1 database."""
 from uuid import uuid5, NAMESPACE_URL
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def register_outputs(conn, task):
@@ -104,3 +104,25 @@ def migrate(conn):
             for (bid,) in conn.execute("SELECT id FROM collection_batches WHERE status='finalized' AND processing_status='pending'").fetchall():
                 seal_inputs(conn, bid)
             conn.execute('PRAGMA user_version=3')
+
+        if version <= 3:
+            conn.execute("""CREATE TABLE acquisition_commit_outbox (
+                event_id TEXT PRIMARY KEY NOT NULL, job_id TEXT NOT NULL UNIQUE,
+                task_id TEXT NOT NULL, batch_id TEXT NOT NULL, source_id TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+                attempt INTEGER NOT NULL CHECK(typeof(attempt)='integer' AND attempt>0),
+                fencing_token INTEGER NOT NULL CHECK(typeof(fencing_token)='integer' AND fencing_token>0),
+                policy_epoch INTEGER NOT NULL CHECK(typeof(policy_epoch)='integer' AND policy_epoch>0),
+                policy_digest TEXT NOT NULL CHECK(length(policy_digest)=64),
+                credential_ref TEXT NOT NULL,
+                credential_generation INTEGER NOT NULL CHECK(typeof(credential_generation)='integer' AND credential_generation>0),
+                package_id TEXT NOT NULL UNIQUE REFERENCES source_packages(id),
+                package_digest TEXT NOT NULL CHECK(length(package_digest)=64),
+                content_fingerprint TEXT NOT NULL CHECK(length(content_fingerprint)=64),
+                committed_at INTEGER NOT NULL CHECK(typeof(committed_at)='integer' AND committed_at>=0),
+                UNIQUE(batch_id,source_id,revision))""")
+            for operation in ('UPDATE', 'DELETE'):
+                conn.execute(f"""CREATE TRIGGER immutable_acquisition_commit_outbox_{operation.lower()}
+                    BEFORE {operation} ON acquisition_commit_outbox BEGIN
+                    SELECT RAISE(ABORT, 'Commit events are immutable'); END""")
+            conn.execute('PRAGMA user_version=4')

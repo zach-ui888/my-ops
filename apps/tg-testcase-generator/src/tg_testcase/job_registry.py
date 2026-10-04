@@ -277,6 +277,7 @@ class JobRegistry(CredentialRegistryMixin):
             self._check_claim(job, claim, now_ms)
             if claim['state'] not in {'claimed', 'fetching'}:
                 fail('LEASE_LOST')
+            self._check_source(job, port.inspect_source(job['task_id'], job['batch_id'], job['source_id']))
             updated = port.heartbeat(claim, min(now_ms + DEFAULT_CLAIM_LEASE_MS, job['deadline']))
             self._check_claim(job, updated, now_ms)
             with self.transaction() as conn:

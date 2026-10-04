@@ -561,7 +561,7 @@ class MigrationTests(unittest.TestCase):
         path = store.directory(task.id) / 'source/text.txt'
         path.write_bytes(b'legacy text')
         with store._locked() as conn, conn:
-            for table in ('source_fetch_runs', 'source_packages', 'source_package_artifacts', 'batch_input_manifests'):
+            for table in ('acquisition_commit_outbox', 'source_fetch_runs', 'source_packages', 'source_package_artifacts', 'batch_input_manifests'):
                 conn.execute('DROP TABLE ' + table)
             for column in ('acquisition_status', 'input_manifest_digest', 'inputs_sealed_at'):
                 conn.execute('ALTER TABLE collection_batches DROP COLUMN ' + column)
@@ -582,7 +582,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(proc.process('batch', 'a')['status'], 'completed')
         self.assertEqual(proc.result('batch')[1][0]['origin'], 'legacy_unknown')
         with store._locked() as conn:
-            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 3)
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 4)
 
     def test_one_to_two_failure_rolls_back(self):
         root, task = self.legacy()
@@ -633,4 +633,4 @@ class MigrationTests(unittest.TestCase):
         store = Store(self.root / 'new')
         Store(store.root)
         with store._locked() as conn:
-            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 3)
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 4)

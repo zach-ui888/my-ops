@@ -6,6 +6,7 @@ claims and source/revision bindings are obtained independently from SQLite.
 import hashlib
 import json
 import time
+from contextlib import nullcontext
 
 from .notion_package import (load_package, encode, digest, require, reference_fingerprint,
     reference_id, MAX_BATCH_BYTES, MAX_BATCH_SOURCES, MAX_ATTACHMENT)
@@ -42,6 +43,7 @@ class OfflineAcquisition:
         self.store, self.clock = store, clock
 
     def claim(self, batch_id, source_id, worker_id, lease_seconds=60):
+        require(not self.store.protected_acquisition, 'Protected acquisition adapter required')
         require(type(worker_id) is str and bool(worker_id) and 0 < lease_seconds <= 3600, 'Invalid acquisition lease')
         with self.store._locked() as conn, conn:
             conn.execute('BEGIN IMMEDIATE')
@@ -69,6 +71,7 @@ class OfflineAcquisition:
         return source
 
     def transition(self, claim, target, delay=0):
+        require(not self.store.protected_acquisition, 'Protected acquisition adapter required')
         allowed = {'fetching': {'claimed'}, 'retry_wait': {'fetching'}, 'abandoned': {'claimed', 'fetching', 'retry_wait'}}
         require(target in allowed and 0 <= delay <= 3600, 'Invalid acquisition transition')
         with self.store._locked() as conn, conn:
@@ -78,11 +81,17 @@ class OfflineAcquisition:
                          (target, target, self.clock()+delay, claim['batch_id'], claim['source_id']))
 
     def heartbeat(self, claim, lease_seconds=60):
+        require(not self.store.protected_acquisition, 'Protected acquisition adapter required')
         require(0 < lease_seconds <= 3600, 'Invalid lease')
         with self.store._locked() as conn, conn:
             conn.execute('BEGIN IMMEDIATE')
             self._check(conn, claim, {'claimed', 'fetching'})
             conn.execute('UPDATE source_fetch_runs SET lease_until=? WHERE batch_id=? AND source_id=?', (self.clock()+lease_seconds, claim['batch_id'], claim['source_id']))
+
+    def _require_protected(self):
+        if self.store.protected_acquisition:
+            from .protected_acquisition import ProtectedReceiverAcquisition
+            require(type(self) is ProtectedReceiverAcquisition, 'Protected acquisition required')
 
     def seal(self, claim, raw, artifacts):
         """Atomically validate and import bytes. No manifest-supplied file is opened.
@@ -91,6 +100,7 @@ class OfflineAcquisition:
         Validation failures leave fetching intact; a producer may submit a small
         failed package with an explicit gap, or retry with a new attempt.
         """
+        self._require_protected()
         from io import BytesIO
         require(type(raw) is bytes and type(artifacts) is dict, 'Invalid seal input')
         require(all(type(b) is bytes for b in artifacts.values()), 'Invalid artifact bytes')
@@ -99,6 +109,7 @@ class OfflineAcquisition:
 
     def seal_stream(self, claim, package_stream, package_length, artifacts, *, staging=None):
         """Consume (id, binary reader) pairs; never hold a DB lock during input."""
+        self._require_protected()
         from .streaming import Staging, read_exact, CHUNK_SIZE
         from .notion_package import MAX_JSON_BYTES
         require(type(package_length) is int and 0 <= package_length <= MAX_JSON_BYTES,
@@ -106,6 +117,8 @@ class OfflineAcquisition:
         raw = read_exact(package_stream, package_length)
         require(package_stream.read(1) == b'', 'Extra package bytes')
         p = load_package(raw)
+        if self.store.protected_acquisition:
+            require(raw == encode(p).encode(), 'Canonical package required')
         canonical_size = len(encode(p).encode())
         require(canonical_size <= MAX_JSON_BYTES, 'Canonical package JSON size limit')
         with self.store._locked() as conn:
@@ -148,28 +161,43 @@ class OfflineAcquisition:
             return self._commit_staged(claim, p, staged)
 
     def _commit_staged(self, claim, p, staged):
+        self._require_protected()
         from .streaming import write_blob
         canonical = encode(p)
         package_digest = hashlib.sha256(canonical.encode()).hexdigest()
         total = len(canonical.encode()) + sum(a['size'] for a in p['artifacts'])
-        with self.store._locked() as conn, conn:
-            conn.execute('BEGIN IMMEDIATE')
-            source = self._check(conn, claim, {'fetching'})
-            require((p['task_id'], p['batch_id'], p['source_id'], p['revision']) ==
-                    (source[0], claim['batch_id'], claim['source_id'], claim['revision']), 'Package binding mismatch')
-            require(reference_id(p['root']['id']) == reference_id(source[1]), 'Root reference mismatch')
-            used = conn.execute('SELECT coalesce(sum(byte_length),0) FROM source_packages WHERE batch_id=?', (claim['batch_id'],)).fetchone()[0]
-            remaining = conn.execute("SELECT count(*) FROM source_inputs i WHERE i.batch_id=? AND i.kind='notion' AND i.source_id!=? AND NOT EXISTS (SELECT 1 FROM source_packages p WHERE p.batch_id=i.batch_id AND p.source_id=i.source_id)",
-                                     (claim['batch_id'], claim['source_id'])).fetchone()[0]
-            # Leave bounded space for failure receipts of still-unsealed sources.
-            require(used + total + remaining * 4096 <= MAX_BATCH_BYTES, 'Batch package limit')
-            conn.execute('INSERT INTO source_packages VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-                         (p['package_id'], p['task_id'], p['batch_id'], p['source_id'], p['revision'],
-                          reference_fingerprint(source[1]), p['content_fingerprint'], package_digest, total, p['outcome'], canonical))
-            for a in p['artifacts']:
-                write_blob(conn, p['package_id'], a, staged.files[a['id']])
-            conn.execute("UPDATE source_fetch_runs SET status='sealed',outcome=? WHERE batch_id=? AND source_id=?", (p['outcome'], claim['batch_id'], claim['source_id']))
-            seal_inputs(conn, claim['batch_id'])
+        protection = getattr(self, '_commit_protection', None)
+        if self.store.protected_acquisition:
+            require(callable(protection), 'Commit protection required')
+        with (protection(claim, p, staged) if protection else nullcontext(None)) as boundary:
+            if self.store.protected_acquisition:
+                from .protected_acquisition import _CommitBoundary
+                require(type(boundary) is _CommitBoundary and boundary.importer is self, 'Trusted commit boundary required')
+            with self.store._locked() as conn, conn:
+                conn.execute('BEGIN IMMEDIATE')
+                if boundary:
+                    replay = boundary.before(conn)
+                    if replay is not None:
+                        return replay
+                source = self._check(conn, claim, {'fetching'})
+                require((p['task_id'], p['batch_id'], p['source_id'], p['revision']) ==
+                        (source[0], claim['batch_id'], claim['source_id'], claim['revision']), 'Package binding mismatch')
+                require(reference_id(p['root']['id']) == reference_id(source[1]), 'Root reference mismatch')
+                used = conn.execute('SELECT coalesce(sum(byte_length),0) FROM source_packages WHERE batch_id=?', (claim['batch_id'],)).fetchone()[0]
+                remaining = conn.execute("SELECT count(*) FROM source_inputs i WHERE i.batch_id=? AND i.kind='notion' AND i.source_id!=? AND NOT EXISTS (SELECT 1 FROM source_packages p WHERE p.batch_id=i.batch_id AND p.source_id=i.source_id)",
+                                         (claim['batch_id'], claim['source_id'])).fetchone()[0]
+                # Leave bounded space for failure receipts of still-unsealed sources.
+                require(used + total + remaining * 4096 <= MAX_BATCH_BYTES, 'Batch package limit')
+                conn.execute('INSERT INTO source_packages VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                             (p['package_id'], p['task_id'], p['batch_id'], p['source_id'], p['revision'],
+                              reference_fingerprint(source[1]), p['content_fingerprint'], package_digest, total, p['outcome'], canonical))
+                for a in p['artifacts']:
+                    write_blob(conn, p['package_id'], a, staged.files[a['id']])
+                conn.execute("UPDATE source_fetch_runs SET status='sealed',outcome=? WHERE batch_id=? AND source_id=?", (p['outcome'], claim['batch_id'], claim['source_id']))
+                seal_inputs(conn, claim['batch_id'])
+                if boundary:
+                    boundary.finish(conn)
+                conn.commit()
         return dict(package_id=p['package_id'], package_digest=package_digest, content_fingerprint=p['content_fingerprint'])
 
     def seal_failure(self, claim, code='acquisition_failed', *, root_type=None):
@@ -178,6 +206,8 @@ class OfflineAcquisition:
         Useful after a package exceeds validation budgets. Invalid input is not
         silently truncated, and it cannot supply the failure receipt's binding.
         """
+        self._require_protected()
+        require(not self.store.protected_acquisition, 'Protected failure packages must be pinned before seal')
         from uuid import uuid4
         from .notion_package import content_fingerprint, GAPS
         root_type = root_type or claim.get('root_type', 'page')

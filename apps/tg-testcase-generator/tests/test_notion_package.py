@@ -589,7 +589,7 @@ class Migration3Tests(unittest.TestCase):
             store=Store(Path(directory)/'db')
             task=store.create('u')
             with store._locked() as conn,conn:
-                for table in ('source_fetch_runs','source_packages','source_package_artifacts','batch_input_manifests'):
+                for table in ('acquisition_commit_outbox', 'source_fetch_runs','source_packages','source_package_artifacts','batch_input_manifests'):
                     conn.execute('DROP TABLE '+table)
                 for column in ('acquisition_status','input_manifest_digest','inputs_sealed_at'):
                     conn.execute('ALTER TABLE collection_batches DROP COLUMN '+column)
@@ -602,7 +602,7 @@ class Migration3Tests(unittest.TestCase):
                 self.assertIsNone(conn.execute("SELECT name FROM sqlite_master WHERE name='source_fetch_runs'").fetchone())
                 conn.execute('DROP TABLE source_packages'); conn.commit()
                 migrate(conn); migrate(conn)
-                self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0],3)
+                self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0],4)
             self.assertEqual(Store(store.root).get(task.id).dumps(),task.dumps())
 
     def test_zero_and_one_through_three_failure_rolls_back_all_steps(self):
@@ -612,7 +612,7 @@ class Migration3Tests(unittest.TestCase):
                 store=Store(Path(directory)/'db')
                 store.create('u')
                 with store._locked() as conn,conn:
-                    for table in ('source_fetch_runs','source_packages','source_package_artifacts','batch_input_manifests',
+                    for table in ('acquisition_commit_outbox', 'source_fetch_runs','source_packages','source_package_artifacts','batch_input_manifests',
                                   'source_inputs','processing_runs','sanitized_contents','batch_manifests','processing_staging'):
                         conn.execute('DROP TABLE '+table)
                     for column in ('acquisition_status','input_manifest_digest','inputs_sealed_at','processing_status'):

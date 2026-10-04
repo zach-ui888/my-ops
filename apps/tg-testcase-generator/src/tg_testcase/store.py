@@ -14,9 +14,15 @@ class VersionConflict(ValueError):
 
 class Store:
     """SQLite authority; JSON is a disposable cache. All writers take one lock."""
-    def __init__(self, root):
+    def __init__(self, root, *, protected_acquisition=False):
+        if type(protected_acquisition) is not bool:
+            raise ValueError('Invalid acquisition mode')
         self.root = inside_project(root)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker = inside_project(self.root / '.protected-acquisition')
+        if protected_acquisition and not marker.exists():
+            atomic_write(marker, b'protected-acquisition-v1\n')
+        self._protected_acquisition = protected_acquisition or marker.exists()
         self.db = inside_project(self.root / "tasks.sqlite3")
         inside_project(self.root / ".lock")
         self.snapshot_errors = []
@@ -35,6 +41,10 @@ class Store:
             """)
             migrate(conn)
 
+    @property
+    def protected_acquisition(self):
+        return self._protected_acquisition or inside_project(self.root / ".protected-acquisition").exists()
+
     @contextmanager
     def _locked(self):
         inside_project(self.root / ".lock")
@@ -46,6 +56,7 @@ class Store:
             fcntl.flock(lock, fcntl.LOCK_EX)
             conn = sqlite3.connect(self.db, timeout=30)
             conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA foreign_keys=ON")
             try:
                 yield conn
             finally:

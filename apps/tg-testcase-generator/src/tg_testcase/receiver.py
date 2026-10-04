@@ -67,6 +67,7 @@ class ChunkReader:
 
 class ReceiverAcquisition(OfflineAcquisition):
     def _commit_staged(self, claim, p, staged):
+        self._require_protected()
         # A retry still consumes and validates the entire stream, including COMMIT.
         with self.store._locked() as conn:
             row = conn.execute('SELECT package_digest,content_fingerprint,id FROM source_packages '
@@ -98,6 +99,13 @@ def receive(acquisition, claim, trusted_job, reader):
         require(h['root_type'] in {'page', 'database', 'data_source'}
                 and type(h['canonical_root_id']) is str
                 and re.fullmatch('[0-9a-f]{32}', h['canonical_root_id']), 'Invalid root')
+        if acquisition.store.protected_acquisition:
+            acquisition._require_protected()
+            authoritative_job, authoritative_claim = acquisition.receiver_binding()
+            require(all(trusted_job[k] == authoritative_job[k] for k in BINDING), 'Untrusted job binding')
+            require(all(claim.get(k) == authoritative_claim[k] for k in
+                        ('batch_id', 'source_id', 'revision', 'worker_id', 'attempt', 'fencing_token')), 'Untrusted claim')
+            trusted_job, claim = authoritative_job, authoritative_claim
         require(all(h[k] == trusted_job[k] for k in BINDING), 'Job binding mismatch')
         require(all(h[k] == claim[k] for k in
                     ('batch_id', 'source_id', 'revision', 'attempt', 'fencing_token')), 'Claim mismatch')
@@ -138,7 +146,8 @@ def receive(acquisition, claim, trusted_job, reader):
                 chunks = ChunkReader(reader)
                 yield a['artifact_id'], chunks
                 require(chunks.ended, 'Unconsumed artifact')
-        importer = ReceiverAcquisition(acquisition.store, acquisition.clock)
+        acquisition._require_protected()
+        importer = acquisition if acquisition.store.protected_acquisition else ReceiverAcquisition(acquisition.store, acquisition.clock)
         receipt = importer.seal_stream(claim, BytesIO(raw), len(raw), artifacts())
         return dict(protocol_version=1, type='ACK', receipt=receipt)
     except (ValueError, KeyError, TypeError, OSError, RuntimeError, sqlite3.Error) as exc:
