@@ -28,6 +28,7 @@ SNAPSHOT_IGNORE = {
     ".venv",
     "secrets",
     ".test-work",
+    ".test-runtime",
 }
 
 TASK_ID_PATTERN = re.compile(
@@ -516,6 +517,8 @@ APPROVAL_BLOCKED_PARTS = {
     "secrets",
     "runtime",
     ".test-work",
+    ".test-runtime",
+    "__pycache__",
     "reference",
 }
 
@@ -530,6 +533,7 @@ APPROVAL_BLOCKED_SUFFIXES = {
     ".key",
     ".p12",
     ".pfx",
+    ".pyc",
 }
 
 
