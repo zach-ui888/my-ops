@@ -5,7 +5,8 @@ cannot protect a directory whose parent is writable by an untrusted runner.
 """
 import os
 import stat
-import tempfile
+from uuid import uuid4
+from .capability_root import CapabilityRoot
 from .notion_package import require
 
 CHUNK_SIZE = 64 * 1024
@@ -23,25 +24,53 @@ def read_exact(reader, size):
 
 class Staging:
     def __init__(self, root):
-        self.root, self.files = root, {}
+        self.capability = root if type(root) is CapabilityRoot else CapabilityRoot.local(root)
+        self.owns_capability = type(root) is not CapabilityRoot
+        self.files = {}
+        self.fd = None
 
     def __enter__(self):
-        info = os.lstat(self.root)
-        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid()
-                and not info.st_mode & 0o022, 'Staging root must be private')
-        self.directory = tempfile.TemporaryDirectory(prefix='seal-', dir=self.root)
+        self.capability.validate()
+        self.name = 'seal-' + uuid4().hex
+        os.mkdir(self.name, mode=0o700, dir_fd=self.capability.fd)
+        try:
+            self.fd = os.open(self.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.capability.fd)
+            info = os.fstat(self.fd)
+            self.inode = (info.st_dev, info.st_ino)
+        except BaseException:
+            if self.owns_capability:
+                self.capability.close()
+            raise
         return self
 
     def create(self, aid):
-        # The artifact ID is an in-memory key only, never a path component.
-        f = tempfile.TemporaryFile(dir=self.directory.name)
+        require(self.fd is not None, 'Inactive staging')
+        require(aid not in self.files, 'Duplicate staging artifact')
+        self.capability.validate()
+        name = uuid4().hex
+        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
+        try:
+            os.unlink(name, dir_fd=self.fd)
+            f = os.fdopen(fd, 'w+b')
+        except BaseException:
+            os.close(fd)
+            raise
         self.files[aid] = f
         return f
 
     def __exit__(self, *args):
-        for f in self.files.values():
-            f.close()
-        self.directory.cleanup()
+        try:
+            for f in self.files.values():
+                f.close()
+            info = os.stat(self.name, dir_fd=self.capability.fd, follow_symlinks=False)
+            if (info.st_dev, info.st_ino) == self.inode:
+                os.rmdir(self.name, dir_fd=self.capability.fd)
+        finally:
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
+            if self.owns_capability:
+                self.capability.close()
 
 
 def write_blob(conn, package_id, a, reader):

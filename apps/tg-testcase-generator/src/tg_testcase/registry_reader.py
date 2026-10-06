@@ -41,9 +41,10 @@ class RegistryReader:
         if self._connection is not None:
             yield self._connection
             return
-        conn = sqlite3.connect(self.db_path.as_uri() + '?mode=ro', uri=True, timeout=5)
-        conn.execute('PRAGMA query_only=ON')
+        from .unix_transport import remaining
+        conn = sqlite3.connect(self.db_path.as_uri() + '?mode=ro', uri=True, timeout=remaining())
         try:
+            conn.execute('PRAGMA query_only=ON')
             self._connection = conn
             conn.execute('BEGIN')
             yield conn

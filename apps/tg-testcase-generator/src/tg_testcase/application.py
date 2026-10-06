@@ -22,6 +22,7 @@ class _TransactionStore:
     """Reuse engine domain actions under the application's single transaction/lock."""
     def __init__(self, store, conn):
         self.store, self.conn = store, conn
+        self.capability = store.capability
         self.changed = {}
         self.ingestion_tasks = set()
 
@@ -48,7 +49,7 @@ class _TransactionStore:
     def cleanup_ingestion(self):
         for tid in self.ingestion_tasks:
             task = self.get(tid)
-            cleanup_sources(self.directory(tid) / 'source', {s.locator for s in task.sources})
+            cleanup_sources(self.directory(tid) / 'source', {s.locator for s in task.sources}, capability=self.capability)
 
     def change(self, task_id, user_id, version, action):
         task = self.get(task_id)
@@ -157,7 +158,7 @@ class Application:
                         blob = base64.b64decode(p['data_base64']) if op == 'append_upload' else p['text'].encode()
                         locator = f'source/{sid}-{filename}'
                         tx.ingestion_tasks.add(current.id)
-                        atomic_write(tx.directory(current.id) / locator, blob)
+                        atomic_write(tx.directory(current.id) / locator, blob, capability=tx.capability)
                         source = Source(sid, filename.rsplit('.', 1)[-1].lower(), locator,
                                         origin='telegram_text' if op == 'append_text' else 'upload',
                                         input_sha256=hashlib.sha256(blob).hexdigest(), byte_length=len(blob))
@@ -243,7 +244,7 @@ class Application:
         relative = Path(row[0])
         if relative.is_absolute() or '..' in relative.parts or len(relative.parts) != 2 or relative.parts[0] != 'output':
             raise ValueError('Invalid artifact boundary')
-        target = inside_project(self.store.directory(task.id) / relative)
-        blob = bounded_read(target, 64 * 1024 * 1024)
+        target = self.store.capability.checked_path(self.store.directory(task.id) / relative)
+        blob = bounded_read(target, 64 * 1024 * 1024, capability=self.store.capability)
         return dict(artifact_id=artifact_id, version=row[1], mode=row[2],
                     filename=target.name, data_base64=base64.b64encode(blob).decode())

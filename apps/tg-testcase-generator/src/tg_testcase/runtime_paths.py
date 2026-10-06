@@ -155,3 +155,28 @@ class RuntimePaths:
             require(meta.kind == 'socket' and meta.mode == 0o660 and meta.uid == uid and meta.gid == gid)
             require(not meta.runner_writable)
         return self
+
+
+def verify_local_directory(path):
+    """Offline capability walk, anchored inside this project, never deployment proof.
+
+    Reject ACLs conservatively instead of guessing effective group membership.
+    Same-UID fixtures cannot prove isolation from the development runner.
+    """
+    import os
+    import stat
+    from .storage import PROJECT, inside_project
+    from .unix_transport import check
+    path = inside_project(path)
+    fd = os.open(PROJECT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for part in (None, *path.relative_to(PROJECT).parts):
+            if part is not None:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            s = os.fstat(fd)
+            check(stat.S_ISDIR(s.st_mode) and s.st_uid == os.geteuid() and not s.st_mode & 0o022)
+            check(not any(n in ('system.posix_acl_access', 'system.posix_acl_default') for n in os.listxattr(fd)))
+    finally:
+        os.close(fd)

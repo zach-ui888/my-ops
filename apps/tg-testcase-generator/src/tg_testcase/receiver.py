@@ -30,9 +30,13 @@ def frame(kind, payload=b''):
 
 
 def read_frame(reader, allowed):
+    if hasattr(reader, "header"):
+        reader.header()
     kind, length = struct.unpack('!BI', read_exact(reader, 5))
     require(kind in allowed and kind in LIMITS, 'Out-of-order/unknown frame')
     require(length <= LIMITS[kind], 'Frame length limit')
+    if hasattr(reader, 'payload'):
+        reader.payload()
     return kind, read_exact(reader, length)
 
 
@@ -44,7 +48,7 @@ def object_frame(payload):
             result[k] = v
         return result
     try:
-        return json.loads(payload, object_pairs_hook=unique)
+        return json.loads(payload.decode("utf-8", errors="strict"), object_pairs_hook=unique)
     except (UnicodeError, RecursionError) as exc:
         raise ValueError('Malformed frame') from exc
 
@@ -81,7 +85,7 @@ class ReceiverAcquisition(OfflineAcquisition):
         return super()._commit_staged(claim, p, staged)
 
 
-def receive(acquisition, claim, trusted_job, reader):
+def receive(acquisition, claim, trusted_job, reader, *, resolver=None):
     """Return a fixed ACK/ERROR object. trusted_job is protected registry data.
 
     Retry ACK requires the same still-live sealed claim; expired/replaced claims
@@ -99,6 +103,14 @@ def receive(acquisition, claim, trusted_job, reader):
         require(h['root_type'] in {'page', 'database', 'data_source'}
                 and type(h['canonical_root_id']) is str
                 and re.fullmatch('[0-9a-f]{32}', h['canonical_root_id']), 'Invalid root')
+        require(type(h['package_length']) is int and 0 <= h['package_length'] <= MAX_JSON_BYTES,
+                'Package length limit')
+        hash_value(h['package_sha256'])
+        if resolver is not None:
+            acquisition = resolver(h['job_id'])
+            from .protected_acquisition import ProtectedReceiverAcquisition
+            require(type(acquisition) is ProtectedReceiverAcquisition, 'Protected resolver required')
+            trusted_job, claim = acquisition.receiver_binding()
         if acquisition.store.protected_acquisition:
             acquisition._require_protected()
             authoritative_job, authoritative_claim = acquisition.receiver_binding()
@@ -117,8 +129,12 @@ def receive(acquisition, claim, trusted_job, reader):
                 'Package length limit')
         hash_value(h['package_sha256'])
         # Check declared length against header before allocating the package.
+        if hasattr(reader, 'header'):
+            reader.header()
         kind, length = struct.unpack('!BI', read_exact(reader, 5))
         require(kind == PACKAGE and length == h['package_length'], 'Package frame mismatch')
+        if hasattr(reader, 'payload'):
+            reader.payload()
         raw = read_exact(reader, length)
         require(hashlib.sha256(raw).hexdigest() == h['package_sha256'], 'Package digest mismatch')
         p = load_package(raw)
@@ -128,12 +144,18 @@ def receive(acquisition, claim, trusted_job, reader):
         require(all(p[k] == h[k] for k in ('task_id', 'batch_id', 'source_id', 'revision')),
                 'Package binding mismatch')
 
+        if hasattr(reader, 'package_budget'):
+            reader.package_budget(len(raw), p['artifacts'])
+
         def artifacts():
             declared = {a['id']: a for a in p['artifacts']}
             while True:
                 kind, payload = read_frame(reader, {ARTIFACT, COMMIT})
                 if kind == COMMIT:
-                    require(reader.read(1) == b'', 'Trailing frame')
+                    if hasattr(reader, 'eof'):
+                        reader.eof()
+                    else:
+                        require(reader.read(1) == b'', 'Trailing frame')
                     return
                 a = object_frame(payload)
                 fields(a, ('artifact_id', 'size', 'sha256'))

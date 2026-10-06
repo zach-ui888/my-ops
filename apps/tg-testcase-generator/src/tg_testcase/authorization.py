@@ -16,6 +16,10 @@ class AuthorizationGuard:
     """
     def __init__(self, path):
         self.path = path
+        info = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode):
+            fail("POLICY_INVALID")
+        self._inode = (info.st_dev, info.st_ino)
         self._local = threading.local()
 
     @property
@@ -29,9 +33,11 @@ class AuthorizationGuard:
             return
         fd = os.open(self.path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != self._inode:
                 fail('POLICY_INVALID')
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            from .unix_transport import bounded_flock
+            bounded_flock(fd)
             self._local.token = object()
             self._local.decisions = set()
             try:

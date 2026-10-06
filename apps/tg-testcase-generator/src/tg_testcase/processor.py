@@ -105,7 +105,7 @@ class Processor:
         if path.is_absolute() or len(path.parts) != 2 or path.parts[0] != 'source' or '..' in path.parts:
             raise ValueError('Invalid registered source locator')
         return bounded_read(self.store.directory(source['task_id']) / str(path), MAX_SOURCE_BYTES,
-                            source['sha256'], source['byte_length'])
+                            source['sha256'], source['byte_length'], capability=self.store.capability)
 
     def parse(self, claim):
         with self.store._locked() as conn, conn:

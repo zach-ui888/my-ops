@@ -135,7 +135,7 @@ class OfflineAcquisition:
                                      (claim['batch_id'], claim['source_id'])).fetchone()[0]
             require(used + canonical_size + sum(a['size'] for a in p['artifacts']) + remaining * 4096
                     <= MAX_BATCH_BYTES, 'Batch package limit')
-        with (staging or Staging(self.store.root)) as staged:
+        with (staging or Staging(self.store.capability)) as staged:
             declared = {a['id']: a for a in p['artifacts']}
             seen = set()
             for aid, reader in artifacts:

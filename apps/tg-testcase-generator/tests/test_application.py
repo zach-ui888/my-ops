@@ -194,7 +194,7 @@ class ApplicationTests(unittest.TestCase):
 
     def test_phase1_migration(self):
         root = self.root / 'legacy'
-        root.mkdir()
+        root.mkdir(mode=0o700)
         task = Task('legacytask', 'u')
         task.outputs = [dict(file='output/formal-v2.xlsx', version=2, mode='formal')]
         with sqlite3.connect(root / 'tasks.sqlite3') as conn:

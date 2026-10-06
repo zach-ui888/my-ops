@@ -4,6 +4,7 @@ import hashlib
 import json
 import time
 
+from .capability_root import CapabilityRoot
 from .acquisition import OfflineAcquisition
 from .acquisition_adapter import read_claim, read_source
 from .authorization import authorize_commit, check_job_authorization
@@ -18,7 +19,7 @@ from .streaming import Staging, CHUNK_SIZE
 class ProtectedReceiverAcquisition(OfflineAcquisition):
     def __init__(self, store, registry_reader, job_id, *, staging_root,
                  clock=time.time, monotonic=time.monotonic):
-        if not store.protected_acquisition or type(registry_reader) is not RegistryReader or staging_root is None:
+        if not store.protected_acquisition or type(registry_reader) is not RegistryReader or type(staging_root) is not CapabilityRoot:
             fail('AUTH_INVALID')
         identifier(job_id)
         super().__init__(store, clock)
@@ -45,7 +46,7 @@ class ProtectedReceiverAcquisition(OfflineAcquisition):
             return job, claim
 
     def seal_stream(self, claim, package_stream, package_length, artifacts, *, staging=None):
-        if staging is not None:
+        if staging is not None or type(self.staging_root) is not CapabilityRoot:
             fail('AUTH_INVALID')
         return super().seal_stream(claim, package_stream, package_length, artifacts,
                                    staging=Staging(self.staging_root))
@@ -107,6 +108,8 @@ class _CommitBoundary:
         return actual
 
     def _time(self, actual):
+        from .unix_transport import remaining
+        remaining()
         now = self.importer.now_ms()
         if self.importer.budget.remaining_ms(now, self.importer.monotonic()) <= 0:
             fail('JOB_TIMEOUT')

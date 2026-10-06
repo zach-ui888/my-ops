@@ -59,7 +59,7 @@ class Engine:
             sid = uuid4().hex
             stored = f"{sid}-{filename}"
             source = TextParser().parse(Source(sid, kind, f"source/{stored}", critical=critical), data)
-            atomic_write(self.store.directory(task.id) / "source" / stored, data)
+            atomic_write(self.store.directory(task.id) / "source" / stored, data, capability=self.store.capability)
             task.sources.append(source)
         return self._change(task_id, user_id, version, action, chat_type)
 
@@ -158,10 +158,10 @@ class Engine:
             blob = render(self.template, current.cases, draft=mode == "draft")
             report = check_coverage(current, draft=mode == "draft").to_dict()
             name = f"{mode}-v{current.version + 1}.xlsx"
-            output = inside_project(self.store.directory(current.id) / "output" / name)
-            atomic_write(output, blob)
+            output = self.store.capability.checked_path(self.store.directory(current.id) / "output" / name)
+            atomic_write(output, blob, capability=self.store.capability)
             regression = validate_export(self.template.read_bytes(), output.read_bytes(), current.cases, mode == "draft")
-            atomic_write(output.with_suffix(".coverage.json"), json.dumps(report, ensure_ascii=False, indent=2).encode())
+            atomic_write(output.with_suffix(".coverage.json"), json.dumps(report, ensure_ascii=False, indent=2).encode(), capability=self.store.capability)
             current.outputs.append({"file": f"output/{name}", "version": current.version + 1,
                                     "mode": mode, "coverage": report, "regression": regression})
             current.transition(State.GENERATED)

@@ -4,6 +4,7 @@ from copy import deepcopy
 import hashlib
 from io import BytesIO
 import json
+import os
 import sqlite3
 import threading
 import unittest
@@ -19,6 +20,7 @@ from tg_testcase.contract_types import canonical
 from tg_testcase.protected_acquisition import ProtectedReceiverAcquisition, _CommitBoundary
 from tg_testcase.registry_reader import RegistryReader
 from tg_testcase.receiver import receive, frame, BINDING, HELLO, PACKAGE, COMMIT, ARTIFACT, CHUNK, END
+from tg_testcase.capability_root import CapabilityRoot
 from tg_testcase.store import Store
 from tg_testcase.streaming import write_blob
 
@@ -28,9 +30,13 @@ class CommitTests(contracts.Base):
         contracts.Base.setUp(self)
         self.now = 1.0
         self.mono = 1.0
-        self.store = Store(self.root / 'acquisition', protected_acquisition=True)
+        acquisition_root = self.root / 'acquisition'
+        acquisition_root.mkdir(mode=0o700)
+        self.store_cap = self.explicit_capability(acquisition_root)
+        self.store = Store(acquisition_root, protected_acquisition=True, capability=self.store_cap)
         self.staging = self.root / 'staging'
         self.staging.mkdir(mode=0o700)
+        self.staging_cap = self.explicit_capability(self.staging)
         self.app = Application(self.store, {'42'})
         self.task = None
         self.send('create_or_get_active')
@@ -60,8 +66,35 @@ class CommitTests(contracts.Base):
         self.job = self.registry.begin_submit(self.job['job_id'], self.port, 1000)
         self.reader = RegistryReader(self.registry.db_path, self.guard)
         self.importer = ProtectedReceiverAcquisition(self.store, self.reader, self.job['job_id'],
-                                                     staging_root=self.staging, clock=lambda: self.now,
+                                                     staging_root=self.staging_cap, clock=lambda: self.now,
                                                      monotonic=lambda: self.mono)
+
+    def explicit_capability(self, path):
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            cap = CapabilityRoot(path, fd)
+        finally:
+            os.close(fd)
+        self.addCleanup(cap.close)
+        return cap
+
+    def test_protected_staging_never_uses_local_factory(self):
+        from tg_testcase.internal_errors import ContractError
+        with patch.object(CapabilityRoot, 'local', side_effect=AssertionError('fallback')):
+            for root in (self.staging, str(self.staging), None):
+                with self.subTest(kind=type(root)), self.assertRaisesRegex(ContractError, '^AUTH_INVALID$'):
+                    ProtectedReceiverAcquisition(self.store, self.reader, self.job['job_id'],
+                                                 staging_root=root)
+            self.seal()
+        self.assertEqual(list(self.staging.iterdir()), [])
+
+    def test_protected_seal_rejects_staging_path_replacement(self):
+        from tg_testcase.internal_errors import ContractError
+        self.importer.staging_root = self.staging
+        with patch.object(CapabilityRoot, 'local', side_effect=AssertionError('fallback')):
+            with self.assertRaisesRegex(ContractError, '^AUTH_INVALID$'):
+                self.seal()
+        self.empty()
 
     def send(self, operation, payload=None):
         req = dict(protocol_version=1, request_id=uuid4().hex,
@@ -246,7 +279,9 @@ class CommitTests(contracts.Base):
 
 
     def test_reopening_store_cannot_downgrade_protection(self):
-        reopened = Store(self.store.root)
+        with self.assertRaisesRegex(ValueError, '^Protected Store requires explicit CapabilityRoot$'):
+            Store(self.store.root)
+        reopened = Store(self.store.root, capability=self.store_cap)
         self.assertTrue(reopened.protected_acquisition)
         with self.assertRaises(ValueError):
             OfflineAcquisition(reopened).seal(self.claim, self.raw, {'a': b'abc'})
@@ -295,7 +330,7 @@ class CommitTests(contracts.Base):
             os._exit(72)
         _, status = os.waitpid(pid, 0)
         self.assertEqual(os.waitstatus_to_exitcode(status), 71)
-        reopened = Store(self.store.root)
+        reopened = Store(self.store.root, capability=self.store_cap)
         with reopened._locked() as conn:
             for table in ('source_packages', 'source_package_artifacts', 'batch_input_manifests', 'acquisition_commit_outbox'):
                 self.assertEqual(conn.execute('SELECT count(*) FROM ' + table).fetchone()[0], 0)
@@ -309,7 +344,7 @@ class CommitTests(contracts.Base):
             os._exit(73)
         _, status = os.waitpid(pid, 0)
         self.assertEqual(os.waitstatus_to_exitcode(status), 73)
-        reopened = Store(self.store.root)
+        reopened = Store(self.store.root, capability=self.store_cap)
         with reopened._locked() as conn:
             for table in ('source_packages', 'source_package_artifacts', 'batch_input_manifests', 'acquisition_commit_outbox'):
                 self.assertEqual(conn.execute('SELECT count(*) FROM ' + table).fetchone()[0], 1)
@@ -446,6 +481,7 @@ class MigrationTests(unittest.TestCase):
 
 class FailedPackageTests(contracts.Base):
     failed_package = True
+    explicit_capability = CommitTests.explicit_capability
     setUp = CommitTests.setUp
     send = CommitTests.send
     sql = CommitTests.sql
